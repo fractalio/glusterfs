@@ -118,6 +118,7 @@ call_bail (void *data)
         struct rpc_clnt       *clnt = NULL;
         rpc_clnt_connection_t *conn = NULL;
         struct timeval         current;
+        struct timespec        ts;
         struct list_head       list;
         struct saved_frame    *saved_frame = NULL;
         struct saved_frame    *trav = NULL;
@@ -147,9 +148,14 @@ call_bail (void *data)
         if (!trans)
                 goto out;
 
-        gettimeofday (&current, NULL);
-        INIT_LIST_HEAD (&list);
+	if ( 0 == clock_gettime(CLOCK_MONOTONIC, &ts))
+	{
+		TIMESPEC_TO_TIMEVAL(&current,&ts)
+	} else {
+		gettimeofday (&current, NULL);
+	}
 
+        INIT_LIST_HEAD (&list);
         pthread_mutex_lock (&conn->lock);
         {
                 /* Chaining to get call-always functionality from

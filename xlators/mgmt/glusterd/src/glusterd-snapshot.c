@@ -141,6 +141,61 @@ glusterd_build_snap_device_path (char *device, char *snapname,
 out:
         return snap_device;
 }
+char *
+glusterd_build_zfs_snap_device_path (char *snapname, int32_t brickcount,
+					glusterd_brickinfo_t  *brickinfo)
+{
+	char        snap[PATH_MAX]      = "";
+	char        msg[1024]           = "";
+	char        zpool[PATH_MAX]  = "";
+	char       *snap_device         = NULL;
+	xlator_t   *this                = NULL;
+	runner_t    runner              = {0,};
+	char       *ptr                 = NULL;
+	int         ret                 = -1;
+
+	this = THIS;
+	GF_ASSERT (this);
+	if (!snapname) {
+		gf_log (this->name, GF_LOG_ERROR, "snapname is NULL");
+		goto out;
+	}
+
+	runinit (&runner);
+	snprintf (msg, sizeof (msg), "running zfs command, "
+			"for getting zfs pool name from brick path");
+	runner_add_args (&runner, "zfs", "list", "-Ho", "name", brickinfo->path, NULL);
+	runner_redir (&runner, STDOUT_FILENO, RUN_PIPE);
+	runner_log (&runner, "", GF_LOG_DEBUG, msg);
+	ret = runner_start (&runner);
+	if (ret == -1) {
+		gf_log (this->name, GF_LOG_ERROR, "Failed to get pool name "
+			"for device %s", brickinfo->path);
+		runner_end (&runner);
+		goto out;
+	}
+	ptr = fgets(zpool, sizeof(zpool),
+			runner_chio (&runner, STDOUT_FILENO));
+	if (!ptr || !strlen(zpool)) {
+		gf_log (this->name, GF_LOG_ERROR, "Failed to get pool name "
+			"for snap %s", snapname);
+		runner_end (&runner);
+		ret = -1;
+		goto out;
+	}
+	runner_end (&runner);
+
+	snprintf (snap, sizeof(snap), "%s@%s_%d", gf_trim(zpool),
+			snapname, brickcount);
+	snap_device = gf_strdup (snap);
+	if (!snap_device) {
+		gf_log (this->name, GF_LOG_WARNING, "Cannot copy the "
+			"snapshot device name for snapname: %s", snapname);
+	}
+
+out:
+	return snap_device;
+}
 
 /* Look for disconnected peers, for missed snap creates or deletes */
 static int32_t
@@ -713,6 +768,7 @@ glusterd_snapshot_restore (dict_t *dict, char **op_errstr, dict_t *rsp_dict)
         glusterd_volinfo_t      *parent_volinfo = NULL;
         glusterd_snap_t         *snap           = NULL;
         glusterd_conf_t         *priv           = NULL;
+	char			*fstype         = NULL;
 
         this = THIS;
 
@@ -783,15 +839,23 @@ glusterd_snapshot_restore (dict_t *dict, char **op_errstr, dict_t *rsp_dict)
                         goto out;
                 }
 
-                /* Take backup of the volinfo folder */
-                ret = glusterd_snapshot_backup_vol (parent_volinfo);
-                if (ret) {
-                        gf_log (this->name, GF_LOG_ERROR, "Failed to backup "
-                                "volume backend files for %s volume",
-                                parent_volinfo->volname);
-                        goto out;
-                }
+		// HACK for now
+		ret = dict_get_str(dict, "snap1.brick1.fs_type", &fstype);
+		if (ret) {
+                        gf_log (this->name, GF_LOG_ERROR, "fstype not set in snap brick");
+			goto out;
+		}
 
+		if (strcmp(fstype, "zfs") != 0) {
+			/* Take backup of the volinfo folder */
+			ret = glusterd_snapshot_backup_vol (parent_volinfo);
+			if (ret) {
+				gf_log (this->name, GF_LOG_ERROR, "Failed to backup "
+					"volume backend files for %s volume",
+					parent_volinfo->volname);
+				goto out;
+			}
+		}
                 if (is_origin_glusterd (dict) == _gf_true) {
                         /* From origin glusterd check if      *
                          * any peers with snap bricks is down */
@@ -1947,39 +2011,51 @@ glusterd_snapshot_create_prevalidate (dict_t *dict, char **op_errstr,
                                 goto out;
                         }
 
-                        device = glusterd_get_brick_mount_device
-                                                          (brickinfo->path);
-                        if (!device) {
-                                snprintf (err_str, sizeof (err_str),
-                                          "getting device name for the brick "
-                                          "%s:%s failed", brickinfo->hostname,
+			ret = glusterd_update_mntopts (brickinfo->path,
+                                                        brickinfo);
+                        if (ret) {
+                                  gf_log (this->name, GF_LOG_ERROR, "Failed to "
+                                          "update mount options for %s brick",
                                           brickinfo->path);
-                                ret = -1;
-                                goto out;
                         }
+			if (strcmp(brickinfo->fstype, "zfs") != 0) {
+				device = glusterd_get_brick_mount_device
+						(brickinfo->path);
+				if (!device) {
+					snprintf (err_str, sizeof (err_str),
+						"getting device name for the brick "
+						"%s:%s failed", brickinfo->hostname,
+						brickinfo->path);
+					ret = -1;
+					goto out;
+				}
 
-                        if (!glusterd_is_thinp_brick (device)) {
-                                snprintf (err_str, sizeof (err_str),
-                                          "Snapshot is supported only for "
-                                          "thin provisioned LV. Ensure that "
-                                          "all bricks of %s are thinly "
-                                          "provisioned LV.", volinfo->volname);
-                                ret = -1;
-                                goto out;
-                        }
+				if (!glusterd_is_thinp_brick (device)) {
+					snprintf (err_str, sizeof (err_str),
+						"Snapshot is supported only for "
+						"thin provisioned LV. Ensure that "
+						"all bricks of %s are thinly "
+						"provisioned LV.", volinfo->volname);
+					ret = -1;
+					goto out;
+				}
 
-                        device = glusterd_build_snap_device_path (device,
-                                                                  snap_volname,
-                                                                  brick_count);
-                        if (!device) {
-                                snprintf (err_str, sizeof (err_str),
-                                          "cannot copy the snapshot device "
-                                          "name (volname: %s, snapname: %s)",
-                                          volinfo->volname, snapname);
-                                loglevel = GF_LOG_WARNING;
-                                ret = -1;
-                                goto out;
-                        }
+				device = glusterd_build_snap_device_path (device,
+							snap_volname,
+							brick_count);
+			} else {
+				device = glusterd_build_zfs_snap_device_path (snap_volname,
+							brick_count, brickinfo);
+			}
+			if (!device) {
+				snprintf (err_str, sizeof (err_str),
+					"cannot copy the snapshot device "
+					"name (volname: %s, snapname: %s)",
+					volinfo->volname, snapname);
+				loglevel = GF_LOG_WARNING;
+				ret = -1;
+				goto out;
+			}
 
                         snprintf (key, sizeof(key),
                                   "vol%"PRId64".brick_snapdevice%"PRId64, i,
@@ -1992,14 +2068,6 @@ glusterd_snapshot_create_prevalidate (dict_t *dict, char **op_errstr,
                                 goto out;
                         }
                         device = NULL;
-
-                        ret = glusterd_update_mntopts (brickinfo->path,
-                                                       brickinfo);
-                        if (ret) {
-                                 gf_log (this->name, GF_LOG_ERROR, "Failed to "
-                                         "update mount options for %s brick",
-                                         brickinfo->path);
-                        }
 
                         snprintf (key, sizeof(key), "vol%"PRId64".fstype%"
                                   PRId64, i, brick_count);
@@ -2255,7 +2323,13 @@ glusterd_do_lvm_snapshot_remove (glusterd_volinfo_t *snap_vol,
         snprintf (msg, sizeof(msg), "remove snapshot of the brick %s:%s, "
                   "device: %s", brickinfo->hostname, brickinfo->path,
                   snap_device);
-        runner_add_args (&runner, LVM_REMOVE, "-f", snap_device, NULL);
+
+	if (strcmp(brickinfo->fstype, "zfs") != 0) {
+		runner_add_args (&runner, LVM_REMOVE, "-f", snap_device, NULL);
+	} else {
+		runner_add_args (&runner, "zfs", "destroy", "-R", brickinfo->device_path, NULL);
+	}
+
         runner_log (&runner, "", GF_LOG_DEBUG, msg);
 
         ret = runner_run (&runner);
@@ -3934,6 +4008,151 @@ glusterd_take_lvm_snapshot (glusterd_brickinfo_t *brickinfo,
 out:
         return ret;
 }
+int32_t
+glusterd_take_zfs_snapshot (glusterd_brickinfo_t *brickinfo,
+                            char *origin_brick_path)
+{
+	char             msg[NAME_MAX]    = "";
+	char             buf[PATH_MAX]    = "";
+	char            *ptr              = NULL;
+	char            *origin_device    = NULL;
+	int              ret              = -1;
+	int              len              = 0;
+	gf_boolean_t     match            = _gf_false;
+	runner_t         runner           = {0,};
+	xlator_t        *this             = NULL;
+	char            delimiter[]       = "/";
+	char            *zpool_name       = NULL;
+	char            *zpool_id         = NULL;
+	char            *s1               = NULL;
+	char            *s2               = NULL;
+
+	this = THIS;
+	GF_ASSERT (this);
+	GF_ASSERT (brickinfo);
+	GF_ASSERT (origin_brick_path);
+
+	s1 = GF_CALLOC(1, 128, gf_gld_mt_char);
+	if (!s1) {
+		gf_log (this->name, GF_LOG_ERROR,
+			"Could not allocate memory for s1");
+		goto out;
+	}
+	s2 = GF_CALLOC(1, 128, gf_gld_mt_char);
+	if (!s2) {
+		gf_log (this->name, GF_LOG_ERROR,
+			"Could not allocate memory for s2");
+		goto out;
+	}
+	strncpy(buf,brickinfo->device_path, sizeof(buf));
+	zpool_name = strtok(buf, "@");
+	if (!zpool_name) {
+		gf_log (this->name, GF_LOG_ERROR,
+			"Could not get zfs pool name");
+		goto out;
+	}
+	zpool_id   = strtok(NULL, "@");
+	if (!zpool_id) {
+		gf_log (this->name, GF_LOG_ERROR,
+			"Could not get zfs pool id");
+		goto out;
+	}
+	/* Taking the actual snapshot */
+	runinit (&runner);
+	snprintf (msg, sizeof (msg), "taking snapshot of the brick %s",
+			origin_brick_path);
+	runner_add_args (&runner, "zfs", "snapshot", brickinfo->device_path, NULL);
+	runner_log (&runner, this->name, GF_LOG_DEBUG, msg);
+	ret = runner_run (&runner);
+	if (ret) {
+		gf_log (this->name, GF_LOG_ERROR, "taking snapshot of the "
+			"brick (%s) of device %s failed",
+			origin_brick_path, brickinfo->device_path);
+
+		goto end;
+	}
+
+	runinit(&runner);
+	snprintf (msg, sizeof (msg), "taking clone of the brick %s",
+			origin_brick_path);
+	sprintf(s1, "%s/%s", zpool_name, zpool_id);
+	runner_add_args (&runner, "zfs", "clone", brickinfo->device_path, s1, NULL);
+	runner_log (&runner, this->name, GF_LOG_DEBUG, msg);
+	ret = runner_run (&runner);
+	if (ret) {
+		gf_log (this->name, GF_LOG_ERROR, "taking clone of the "
+			"brick (%s) of device %s %s failed",
+			origin_brick_path, brickinfo->device_path, s1);
+
+		goto end;
+	}
+
+	runinit(&runner);
+	snprintf (msg, sizeof (msg), "mount clone of the brick %s",
+			origin_brick_path);
+	sprintf(s2, "mountpoint=%s", brickinfo->path);
+	runner_add_args (&runner, "zfs", "set", s2, s1, NULL);
+	runner_log (&runner, this->name, GF_LOG_DEBUG, msg);
+	ret = runner_run (&runner);
+	if (ret) {
+		gf_log (this->name, GF_LOG_ERROR, "taking snapshot of the "
+			"brick (%s) of device %s %s failed",
+			origin_brick_path, s2, s1);
+	}
+
+end:
+	//runner_end (&runner);
+out:
+        return ret;
+}
+
+int
+glusterd_zfs_snap_restore (dict_t *dict, dict_t *rsp_dict,
+                        glusterd_volinfo_t *snap_vol,
+                        glusterd_volinfo_t *orig_vol,
+                        int32_t volcount)
+{
+
+	runner_t    runner                             = {0,};
+        int         ret                 	       = -1;
+        int32_t                   brickcount           = -1;
+	glusterd_brickinfo_t     *brickinfo            = NULL;
+	xlator_t                *this                  = NULL;
+	char                    msg[1024]              = {0, };
+
+	this = THIS;
+
+	/*	1. Loop through all bricks in snapvol
+		2. Run zfs rollback
+		3. if failure , return error
+		4. what is rollback process...
+	*/
+
+	brickcount = 0;
+	list_for_each_entry (brickinfo, &snap_vol->bricks, brick_list) {
+		brickcount++;
+		runinit (&runner);
+		runner_add_args (&runner, "zfs", "rollback", brickinfo->device_path,
+					NULL);
+		runner_redir (&runner, STDOUT_FILENO, RUN_PIPE);
+		snprintf (msg, sizeof (msg), "Start zfs rollback for %s", brickinfo->device_path);
+		runner_log (&runner, this->name, GF_LOG_DEBUG, msg);
+		ret = runner_start (&runner);
+		if (ret == -1) {
+			gf_log (this->name, GF_LOG_ERROR, "Failed to rollback "
+				"for %s", brickinfo->device_path);
+			runner_end (&runner);
+			goto out;
+		}
+	}
+
+	// Delete snapshot object here
+
+	ret = 0;
+
+out:
+	return ret;
+}
 
 int32_t
 glusterd_snap_brick_create (glusterd_volinfo_t *snap_volinfo,
@@ -3951,33 +4170,32 @@ glusterd_snap_brick_create (glusterd_volinfo_t *snap_volinfo,
 
         GF_ASSERT (snap_volinfo);
         GF_ASSERT (brickinfo);
-
-        snprintf (snap_brick_mount_path, sizeof (snap_brick_mount_path),
-                  "%s/%s/brick%d",  snap_mount_folder, snap_volinfo->volname,
-                  brick_count + 1);
-
-        ret = mkdir_p (snap_brick_mount_path, 0777, _gf_true);
-        if (ret) {
-                gf_log (this->name, GF_LOG_ERROR, "creating the brick directory"
-                        " %s for the snapshot %s(device: %s) failed",
-                        snap_brick_mount_path, snap_volinfo->volname,
-                        brickinfo->device_path);
-                goto out;
-        }
-        /* mount the snap logical device on the directory inside
-           /run/gluster/snaps/<snapname>/@snap_brick_mount_path
-           Way to mount the snap brick via mount api is this.
-           ret = mount (device, snap_brick_mount_path, entry->mnt_type,
-                        MS_MGC_VAL, "nouuid");
-           But for now, mounting using runner apis.
-        */
-        ret = glusterd_mount_lvm_snapshot (brickinfo, snap_brick_mount_path);
-        if (ret) {
-                gf_log (this->name, GF_LOG_ERROR,
-                        "Failed to mount lvm snapshot.");
-                goto out;
-        }
-
+	if (strcmp(brickinfo->fstype, "zfs") != 0) {
+		snprintf (snap_brick_mount_path, sizeof (snap_brick_mount_path),
+				"%s/%s/brick%d",  snap_mount_folder, snap_volinfo->volname,
+				brick_count + 1);
+		ret = mkdir_p (snap_brick_mount_path, 0777, _gf_true);
+		if (ret) {
+			gf_log (this->name, GF_LOG_ERROR, "creating the brick directory"
+				" %s for the snapshot %s(device: %s) failed",
+				snap_brick_mount_path, snap_volinfo->volname,
+				brickinfo->device_path);
+			goto out;
+		}
+		/* mount the snap logical device on the directory inside
+		/run/gluster/snaps/<snapname>/@snap_brick_mount_path
+		Way to mount the snap brick via mount api is this.
+		ret = mount (device, snap_brick_mount_path, entry->mnt_type,
+		MS_MGC_VAL, "nouuid");
+		But for now, mounting using runner apis.
+		*/
+		ret = glusterd_mount_lvm_snapshot (brickinfo, snap_brick_mount_path);
+		if (ret) {
+			gf_log (this->name, GF_LOG_ERROR,
+				"Failed to mount lvm snapshot.");
+			goto out;
+		}
+	}
         ret = stat (brickinfo->path, &statbuf);
         if (ret) {
                 gf_log (this->name, GF_LOG_WARNING, "stat of the brick %s"
@@ -4004,7 +4222,9 @@ out:
                         " mount %s", snap_brick_mount_path);
                 /*umount2 system call doesn't cleanup mtab entry after un-mount.
                   So use external umount command*/
-                glusterd_umount (snap_brick_mount_path);
+		if (strcmp(brickinfo->fstype, "zfs") != 0) {
+			glusterd_umount (snap_brick_mount_path);
+		}
         }
 
         gf_log (this->name, GF_LOG_TRACE, "Returning %d", ret);
@@ -4277,29 +4497,34 @@ glusterd_take_brick_snapshot (dict_t *dict, glusterd_volinfo_t *snap_vol,
                         "brick path (%s)", key);
                 goto out;
         }
-
-        ret = glusterd_take_lvm_snapshot (brickinfo, origin_brick_path);
-        if (ret) {
-                gf_log (this->name, GF_LOG_ERROR, "Failed to take snapshot of "
-                        "brick %s:%s", brickinfo->hostname, origin_brick_path);
-                goto out;
-        }
+	if (strcmp(brickinfo->fstype, "zfs") == 0) {
+		ret = glusterd_take_zfs_snapshot (brickinfo, origin_brick_path);
+	} else {
+		ret = glusterd_take_lvm_snapshot (brickinfo, origin_brick_path);
+	}
+	if (ret) {
+		gf_log (this->name, GF_LOG_ERROR, "Failed to take snapshot of "
+			"brick %s:%s", brickinfo->hostname, origin_brick_path);
+		goto out;
+	}
 
         /* After the snapshot both the origin brick (LVM brick) and
          * the snapshot brick will have the same file-system label. This
          * will cause lot of problems at mount time. Therefore we must
          * generate a new label for the snapshot brick
          */
-        ret = glusterd_update_fs_label (brickinfo);
-        if (ret) {
-                gf_log (this->name, GF_LOG_ERROR, "Failed to update "
-                        "file-system label for %s brick", brickinfo->path);
-                /* Failing to update label should not cause snapshot failure.
-                 * Currently label is updated only for XFS and ext2/ext3/ext4
-                 * file-system.
-                 */
-        }
 
+	if (strcmp(brickinfo->fstype, "zfs") != 0) {
+		ret = glusterd_update_fs_label (brickinfo);
+		if (ret) {
+			gf_log (this->name, GF_LOG_ERROR, "Failed to update "
+				"file-system label for %s brick", brickinfo->path);
+			/* Failing to update label should not cause snapshot failure.
+			* Currently label is updated only for XFS and ext2/ext3/ext4
+			* file-system.
+			*/
+		}
+	}
         /* create the complete brick here */
         ret = glusterd_snap_brick_create (snap_vol, brickinfo, brick_count);
         if (ret) {
@@ -6039,6 +6264,85 @@ out:
 }
 
 int
+glusterd_get_brick_zfs_details (dict_t *rsp_dict,
+                               glusterd_brickinfo_t *brickinfo, char *volname,
+                                char *device, char *key_prefix)
+{
+
+	int                     ret             =       -1;
+	glusterd_conf_t         *priv           =       NULL;
+	runner_t                runner          =       {0,};
+	xlator_t                *this           =       NULL;
+	char                    msg[PATH_MAX]   =       "";
+	char                    buf[PATH_MAX]   =       "";
+	char                    *ptr            =       NULL;
+	char                    *token          =       NULL;
+	char                    key[PATH_MAX]   =       "";
+	char                    *value          =       NULL;
+
+	GF_ASSERT (rsp_dict);
+	GF_ASSERT (brickinfo);
+	GF_ASSERT (volname);
+	this = THIS;
+	GF_ASSERT (this);
+	priv = this->private;
+	GF_ASSERT (priv);
+
+	runinit (&runner);
+	snprintf (msg, sizeof (msg), "running zfs command, "
+			"for getting snap status");
+
+	runner_add_args (&runner, "zfs", "list", "-Ho",
+			"used", "-t", "snapshot", brickinfo->device_path, NULL);
+	runner_redir (&runner, STDOUT_FILENO, RUN_PIPE);
+	runner_log (&runner, "", GF_LOG_DEBUG, msg);
+	ret = runner_start (&runner);
+	if (ret) {
+		gf_log (this->name, GF_LOG_ERROR,
+			"Could not perform zfs action");
+		goto end;
+	}
+	do {
+		ptr = fgets (buf, sizeof (buf),
+			runner_chio (&runner, STDOUT_FILENO));
+
+		if (ptr == NULL)
+			break;
+		ret = snprintf (key, sizeof (key), "%s.vgname",
+				key_prefix);
+		if (ret < 0) {
+			goto end;
+		}
+
+		value = gf_strdup (brickinfo->device_path);
+		ret = dict_set_dynstr (rsp_dict, key, value);
+		if (ret) {
+			gf_log (this->name, GF_LOG_ERROR,
+				"Could not save vgname ");
+			goto end;
+		}
+
+		ret = snprintf (key, sizeof (key), "%s.lvsize",
+				key_prefix);
+		if (ret < 0) {
+			goto end;
+		}
+		value = gf_strdup (gf_trim(buf));
+		ret = dict_set_dynstr (rsp_dict, key, value);
+		if (ret) {
+			gf_log (this->name, GF_LOG_ERROR,
+				"Could not save meta data percent ");
+			goto end;
+		}
+	} while (ptr != NULL);
+
+	ret = 0;
+end:
+	runner_end (&runner);
+	return ret;
+}
+
+int
 glusterd_get_single_brick_status (char **op_errstr, dict_t *rsp_dict,
                                  char *keyprefix, int index,
                                  glusterd_volinfo_t *snap_volinfo,
@@ -6169,20 +6473,30 @@ glusterd_get_single_brick_status (char **op_errstr, dict_t *rsp_dict,
                 goto out;
         }
 
-        ret = glusterd_get_brick_lvm_details (rsp_dict, brickinfo,
-                                              snap_volinfo->volname,
-                                              device, key);
-        if (ret) {
-                gf_log (this->name, GF_LOG_ERROR, "Failed to get "
-                        "brick LVM details");
-                goto out;
-        }
+	if (strcmp(brickinfo->fstype, "zfs") != 0)
+	{
+		ret = glusterd_get_brick_lvm_details (rsp_dict, brickinfo,
+				snap_volinfo->volname,device, key);
+		if (ret) {
+			gf_log (this->name, GF_LOG_ERROR, "Failed to get "
+				"brick LVM details");
+			goto out;
+		}
+	} else {
+		ret = glusterd_get_brick_zfs_details (rsp_dict, brickinfo,
+				snap_volinfo->volname,device, key);
+		if (ret) {
+			gf_log (this->name, GF_LOG_ERROR, "Failed to get "
+				"brick LVM details");
+			goto out;
+		}
+	}
 out:
-        if (ret && value) {
-                GF_FREE (value);
-        }
+	if (ret && value) {
+		GF_FREE (value);
+	}
 
-        return ret;
+	return ret;
 }
 
 int
@@ -7110,49 +7424,99 @@ glusterd_snapshot_restore_cleanup (dict_t *rsp_dict,
         GF_ASSERT (volinfo);
         GF_ASSERT (snap);
 
-        /* If the volinfo is already restored then we should delete
-         * the backend LVMs */
-        if (!uuid_is_null (volinfo->restored_from_snap)) {
-                ret = glusterd_lvm_snapshot_remove (rsp_dict, volinfo);
-                if (ret) {
-                        gf_log (this->name, GF_LOG_ERROR, "Failed to remove "
-                                "LVM backend");
-                        goto out;
-                }
-        }
+	/* If the volinfo is already restored then we should delete
+	* the backend LVMs */
+	if (!uuid_is_null (volinfo->restored_from_snap)) {
+		ret = glusterd_lvm_snapshot_remove (rsp_dict, volinfo);
+		if (ret) {
+			gf_log (this->name, GF_LOG_ERROR, "Failed to remove "
+				"LVM backend");
+			goto out;
+		}
+	}
 
-        snprintf (delete_path, sizeof (delete_path),
-                  "%s/"GLUSTERD_TRASH"/vols-%s.deleted", priv->workdir,
-                  volinfo->volname);
+	/* Restore is successful therefore delete the original volume's
+	* volinfo.
+	*/
+	ret = glusterd_volinfo_delete (volinfo);
+	if (ret) {
+		gf_log (this->name, GF_LOG_ERROR, "Failed to delete volinfo");
+		goto out;
+	}
 
-        /* Restore is successful therefore delete the original volume's
-         * volinfo.
-         */
-        ret = glusterd_volinfo_delete (volinfo);
-        if (ret) {
-                gf_log (this->name, GF_LOG_ERROR, "Failed to delete volinfo");
-                goto out;
-        }
+	snprintf (delete_path, sizeof (delete_path),
+			"%s/"GLUSTERD_TRASH"/vols-%s.deleted", priv->workdir,
+			volinfo->volname);
+	/* Delete the backup copy of volume folder */
+	ret = glusterd_recursive_rmdir (delete_path);
+	if (ret) {
+		gf_log (this->name, GF_LOG_ERROR, "Failed to remove "
+			"backup dir (%s)", delete_path);
+		goto out;
+	}
 
-        /* Now delete the snap entry. */
-        ret = glusterd_snap_remove (rsp_dict, snap, _gf_false, _gf_true);
-        if (ret) {
-                gf_log (this->name, GF_LOG_WARNING, "Failed to delete "
-                        "snap %s", snap->snapname);
-                goto out;
-        }
+	/* Now delete the snap entry. */
+	ret = glusterd_snap_remove (rsp_dict, snap, _gf_false, _gf_true);
+	if (ret) {
+		gf_log (this->name, GF_LOG_WARNING, "Failed to delete "
+			"snap %s", snap->snapname);
+		goto out;
+	}
 
-        /* Delete the backup copy of volume folder */
-        ret = glusterd_recursive_rmdir (delete_path);
-        if (ret) {
-                gf_log (this->name, GF_LOG_ERROR, "Failed to remove "
-                        "backup dir (%s)", delete_path);
-                goto out;
-        }
-
-        ret = 0;
+	ret = 0;
 out:
-        return ret;
+	return ret;
+}
+
+int
+glusterd_snapshot_zfs_restore_cleanup (dict_t *rsp_dict,
+                                   glusterd_volinfo_t *volinfo,
+                                   glusterd_snap_t *snap)
+{
+	int                     ret                     = -1;
+	char                    delete_path[PATH_MAX]   = {0,};
+	xlator_t               *this                    = NULL;
+	glusterd_conf_t        *priv                    = NULL;
+	runner_t                runner                  = {0,};
+	glusterd_brickinfo_t   *brickinfo               = NULL;
+	char                    msg[PATH_MAX]           = "";
+	glusterd_volinfo_t     *snapvol                = NULL;
+	glusterd_volinfo_t     *tmp_vol                 = NULL;
+
+
+	this = THIS;
+	GF_ASSERT (this);
+	priv = this->private;
+
+	GF_ASSERT (rsp_dict);
+	GF_ASSERT (volinfo);
+	GF_ASSERT (snap);
+
+	list_for_each_entry_safe (snapvol, tmp_vol, &volinfo->snap_volumes,
+					snapvol_list) {
+		if (snapvol->snapshot &&
+		    strcmp(snapvol->snapshot->snapname, snap->snapname) == 0) {
+			ret = glusterd_lvm_snapshot_remove (rsp_dict, snapvol);
+			if (ret) {
+				gf_log (this->name, GF_LOG_ERROR, "Failed to remove "
+					"ZFS backend");
+				goto out;
+			}
+			break;
+		}
+	}
+
+	/* Now delete the snap entry. */
+	ret = glusterd_snap_remove (rsp_dict, snap, _gf_false, _gf_true);
+	if (ret) {
+		gf_log (this->name, GF_LOG_WARNING, "Failed to delete "
+			"snap %s", snap->snapname);
+		goto out;
+	}
+
+	ret = 0;
+out:
+	return ret;
 }
 
 /* This function is called when the snapshot restore operation failed
@@ -7302,6 +7666,7 @@ glusterd_snapshot_restore_postop (dict_t *dict, int32_t op_ret,
         glusterd_snap_t        *snap            = NULL;
         glusterd_volinfo_t     *volinfo         = NULL;
         xlator_t               *this            = NULL;
+	char		       *fstype          = NULL;
 
         this = THIS;
 
@@ -7338,37 +7703,49 @@ glusterd_snapshot_restore_postop (dict_t *dict, int32_t op_ret,
                         "Volume (%s) does not exist ", volname);
                 goto out;
         }
+	// HACK for now
+	ret = dict_get_str(dict, "snap1.brick1.fs_type", &fstype);
+	if (ret) {
+		gf_log (this->name, GF_LOG_ERROR, "snapshot postop fstype not set in snap brick");
+		goto out;
+	}
 
-        /* On success perform the cleanup operation */
-        if (0 == op_ret) {
-                ret = glusterd_snapshot_restore_cleanup (rsp_dict, volinfo,
-                                                         snap);
-                if (ret) {
-                        gf_log (this->name, GF_LOG_ERROR, "Failed to perform "
-                                "snapshot restore cleanup for %s volume",
-                                volname);
-                        goto out;
-                }
-        } else { /* On failure revert snapshot restore */
+	/* On success perform the cleanup operation */
+	if (0 == op_ret) {
+		if (strcmp (fstype, "zfs") != 0) {
+			ret = glusterd_snapshot_restore_cleanup (rsp_dict, volinfo,
+								snap);
+		} else {
+			ret = glusterd_snapshot_zfs_restore_cleanup(rsp_dict, volinfo,
+								snap);
+		}
+		if (ret) {
+			gf_log (this->name, GF_LOG_ERROR, "Failed to perform "
+				"snapshot zfs restore cleanup for %s volume",
+				volname);
+			goto out;
+		}
+	} else { /* On failure revert snapshot restore */
                 ret = dict_get_int32 (dict, "cleanup", &cleanup);
                 /* Perform cleanup only when required */
                 if (ret || (0 == cleanup)) {
                         ret = 0;
                         goto out;
                 }
-
-                ret = glusterd_snapshot_revert_partial_restored_vol (volinfo,
+		if (strcmp(fstype, "zfs") != 0) {
+			ret = glusterd_snapshot_revert_partial_restored_vol (volinfo,
                                                                      _gf_false);
-                if (ret) {
-                        gf_log (this->name, GF_LOG_ERROR, "Failed to revert "
-                                "restore operation for %s volume", volname);
-                        goto out;
-                }
-        }
+			if (ret) {
+				gf_log (this->name, GF_LOG_ERROR, "Failed to revert "
+					"restore operation for %s volume", volname);
+				goto out;
+			}
+		}
+	}
 
-        ret = 0;
+	ret = 0;
 out:
-        return ret;
+	return ret;
 }
 
 int
@@ -8061,6 +8438,7 @@ gd_restore_snap_volume (dict_t *dict, dict_t *rsp_dict,
         glusterd_conf_t         *conf           = NULL;
         glusterd_volinfo_t      *temp_volinfo   = NULL;
         glusterd_volinfo_t      *voliter        = NULL;
+	char			*fstype         = NULL;
 
         this = THIS;
         GF_ASSERT (this);
@@ -8101,76 +8479,91 @@ gd_restore_snap_volume (dict_t *dict, dict_t *rsp_dict,
                 goto out;
         }
 
-        /* Create a new volinfo for the restored volume */
-        ret = glusterd_volinfo_dup (snap_vol, &new_volinfo, _gf_true);
-        if (ret) {
-                gf_log (this->name, GF_LOG_ERROR, "Failed to create volinfo");
-                goto out;
+        // HACK for now
+        ret = dict_get_str(dict, "snap1.brick1.fs_type", &fstype);
+	if (ret) {
+                   gf_log (this->name, GF_LOG_ERROR, "fstype not set in snap brick");
+                   goto out;
         }
+	if (strcmp(fstype, "zfs") != 0) {
 
-        /* Following entries need to be derived from origin volume. */
-        strcpy (new_volinfo->volname, orig_vol->volname);
-        uuid_copy (new_volinfo->volume_id, orig_vol->volume_id);
-        new_volinfo->snap_count = orig_vol->snap_count;
-        new_volinfo->snap_max_hard_limit = orig_vol->snap_max_hard_limit;
-        uuid_copy (new_volinfo->restored_from_snap,
-                   snap_vol->snapshot->snap_id);
+		/* Create a new volinfo for the restored volume */
+		ret = glusterd_volinfo_dup (snap_vol, &new_volinfo, _gf_true);
+		if (ret) {
+			gf_log (this->name, GF_LOG_ERROR, "Failed to create volinfo");
+			goto out;
+		}
 
-        /* Bump the version of the restored volume, so that nodes *
-         * which are done can sync during handshake */
-        new_volinfo->version = orig_vol->version;
+		/* Following entries need to be derived from origin volume. */
+		strcpy (new_volinfo->volname, orig_vol->volname);
+		uuid_copy (new_volinfo->volume_id, orig_vol->volume_id);
+		new_volinfo->snap_count = orig_vol->snap_count;
+		new_volinfo->snap_max_hard_limit = orig_vol->snap_max_hard_limit;
+		uuid_copy (new_volinfo->restored_from_snap,
+			snap_vol->snapshot->snap_id);
 
-        list_for_each_entry_safe (voliter, temp_volinfo,
-                         &orig_vol->snap_volumes, snapvol_list) {
-                list_add_tail (&voliter->snapvol_list,
-                               &new_volinfo->snap_volumes);
-        }
-        /* Copy the snap vol info to the new_volinfo.*/
-        ret = glusterd_snap_volinfo_restore (dict, rsp_dict, new_volinfo,
-                                             snap_vol, volcount);
-        if (ret) {
-                gf_log (this->name, GF_LOG_ERROR, "Failed to restore snap");
-                goto out;
-        }
+		/* Bump the version of the restored volume, so that nodes *
+		* which are done can sync during handshake */
+		new_volinfo->version = orig_vol->version;
 
-        ret = glusterd_restore_geo_rep_files (snap_vol);
-        if (ret) {
-                gf_log (this->name, GF_LOG_ERROR, "Failed to restore "
-                        "geo-rep files for snap %s",
-                        snap_vol->snapshot->snapname);
-                goto out;
-        }
+		list_for_each_entry_safe (voliter, temp_volinfo,
+				&orig_vol->snap_volumes, snapvol_list) {
+			list_add_tail (&voliter->snapvol_list,
+					&new_volinfo->snap_volumes);
+		}
+		/* Copy the snap vol info to the new_volinfo.*/
+		ret = glusterd_snap_volinfo_restore (dict, rsp_dict, new_volinfo,
+							snap_vol, volcount);
+		if (ret) {
+			gf_log (this->name, GF_LOG_ERROR, "Failed to restore snap");
+			goto out;
+		}
 
-        ret = glusterd_copy_quota_files (snap_vol, orig_vol);
-        if (ret) {
-                gf_log (this->name, GF_LOG_ERROR, "Failed to restore "
-                        "quota files for snap %s",
-                        snap_vol->snapshot->snapname);
-                goto out;
-        }
+		ret = glusterd_restore_geo_rep_files (snap_vol);
+		if (ret) {
+			gf_log (this->name, GF_LOG_ERROR, "Failed to restore "
+				"geo-rep files for snap %s",
+				snap_vol->snapshot->snapname);
+			goto out;
+		}
 
-        /* New volinfo always shows the status as created. Therefore
-         * set the status to the original volume's status. */
-        glusterd_set_volume_status (new_volinfo, orig_vol->status);
+		ret = glusterd_copy_quota_files (snap_vol, orig_vol);
+		if (ret) {
+			gf_log (this->name, GF_LOG_ERROR, "Failed to restore "
+				"quota files for snap %s",
+				snap_vol->snapshot->snapname);
+			goto out;
+		}
 
-        list_add_tail (&new_volinfo->vol_list, &conf->volumes);
+		/* New volinfo always shows the status as created. Therefore
+		* set the status to the original volume's status. */
+		glusterd_set_volume_status (new_volinfo, orig_vol->status);
 
-        ret = glusterd_store_volinfo (new_volinfo,
-                                      GLUSTERD_VOLINFO_VER_AC_INCREMENT);
-        if (ret) {
-                gf_log (this->name, GF_LOG_ERROR, "Failed to store volinfo");
-                goto out;
-        }
+		list_add_tail (&new_volinfo->vol_list, &conf->volumes);
 
-        ret = 0;
+		ret = glusterd_store_volinfo (new_volinfo,
+				GLUSTERD_VOLINFO_VER_AC_INCREMENT);
+		if (ret) {
+			gf_log (this->name, GF_LOG_ERROR, "Failed to store volinfo");
+			goto out;
+		}
+
+		ret = 0;
+	} else {
+		ret = glusterd_zfs_snap_restore(dict, rsp_dict, snap_vol, orig_vol, volcount);
+		return ret;
+	}
+
 out:
-        if (ret && NULL != new_volinfo) {
-                /* In case of any failure we should free new_volinfo. Doing
-                 * this will also remove the entry we added in conf->volumes
-                 * if it was added there.
-                 */
-                (void)glusterd_volinfo_delete (new_volinfo);
-        }
+	if (strcmp(fstype, "zfs") != 0) {
+		if (ret && NULL != new_volinfo) {
+		/* In case of any failure we should free new_volinfo. Doing
+		* this will also remove the entry we added in conf->volumes
+		* if it was added there.
+		*/
+		(void)glusterd_volinfo_delete (new_volinfo);
+		}
+	}
 
         return ret;
 }

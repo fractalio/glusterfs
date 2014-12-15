@@ -1921,15 +1921,25 @@ glusterd_volume_start_glusterfs (glusterd_volinfo_t  *volinfo,
 
         (void) snprintf (glusterd_uuid, 1024, "*-posix.glusterd-uuid=%s",
                          uuid_utoa (MY_UUID));
-        runner_add_args (&runner, SBIN_DIR"/glusterfsd",
-                         "-s", brickinfo->hostname, "--volfile-id", volfile,
-                         "-p", pidfile, "-S", socketpath,
-                         "--brick-name", brickinfo->path,
-                         "-l", brickinfo->logfile,
-                         "--xlator-option", glusterd_uuid,
-                         NULL);
-
-        runner_add_arg (&runner, "--brick-port");
+	if (volinfo->is_snap_volume) {
+		runner_add_args (&runner, SBIN_DIR"/glusterfsd",
+			"-s", brickinfo->hostname, "--volfile-id", volfile,
+			"-p", pidfile, "-S", socketpath,
+			"--brick-name", brickinfo->path,
+			"-l", brickinfo->logfile,
+			"--xlator-option", glusterd_uuid,
+			"--read-only",
+			NULL);
+	} else {
+		runner_add_args (&runner, SBIN_DIR"/glusterfsd",
+			"-s", brickinfo->hostname, "--volfile-id", volfile,
+			"-p", pidfile, "-S", socketpath,
+			"--brick-name", brickinfo->path,
+			"-l", brickinfo->logfile,
+			"--xlator-option", glusterd_uuid,
+			NULL);
+	}
+	runner_add_arg (&runner, "--brick-port");
         if (volinfo->transport_type != GF_TRANSPORT_BOTH_TCP_RDMA) {
                 runner_argprintf (&runner, "%d", port);
         } else {
@@ -7251,6 +7261,7 @@ static struct fs_info {
         { "ext3", "tune2fs", "-l", "Inode size:", "e2fsprogs" },
         { "ext4", "tune2fs", "-l", "Inode size:", "e2fsprogs" },
         { "btrfs", NULL, NULL, NULL, NULL },
+        { "zfs", NULL, NULL, NULL, NULL },
         { NULL, NULL, NULL, NULL, NULL}
 };
 
