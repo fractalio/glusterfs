@@ -7301,6 +7301,12 @@ glusterd_add_inode_size_to_dict (dict_t *dict, int count)
         if (ret)
                 goto out;
 
+	//zfs case
+	if (strcmp(fs_name, "zfs") == 0) {
+		ret = 0;
+		goto out;
+	}
+
         runinit (&runner);
         runner_redir (&runner, STDOUT_FILENO, RUN_PIPE);
 
@@ -7589,9 +7595,9 @@ glusterd_add_brick_detail_to_dict (glusterd_volinfo_t *volinfo,
 
         ret = glusterd_add_brick_mount_details (brickinfo, dict, count);
         if (ret)
-                goto out;
+               	goto out;
 
-        ret = glusterd_add_inode_size_to_dict (dict, count);
+       	ret = glusterd_add_inode_size_to_dict (dict, count);
  out:
         if (ret)
                 gf_log (this->name, GF_LOG_DEBUG, "Error adding brick"

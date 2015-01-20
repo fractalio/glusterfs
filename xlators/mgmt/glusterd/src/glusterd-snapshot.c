@@ -2283,8 +2283,10 @@ glusterd_do_lvm_snapshot_remove (glusterd_volinfo_t *snap_vol,
                 goto out;
         }
         GF_ASSERT (snap_vol);
-        GF_ASSERT (mount_pt);
-        GF_ASSERT (snap_device);
+	if (strcmp(brickinfo->fstype, "zfs") != 0) {
+        	GF_ASSERT (mount_pt);
+        	GF_ASSERT (snap_device);
+        }
 
         GLUSTERD_GET_BRICK_PIDFILE (pidfile, snap_vol, brickinfo, priv);
         if (gf_is_service_running (pidfile, &pid)) {
@@ -2298,31 +2300,38 @@ glusterd_do_lvm_snapshot_remove (glusterd_volinfo_t *snap_vol,
 
         /* umount cannot be done when the brick process is still in the process
            of shutdown, so give three re-tries */
-        while (retry_count < 3) {
-                retry_count++;
-                /*umount2 system call doesn't cleanup mtab entry after un-mount.
-                  So use external umount command*/
-                ret = glusterd_umount(mount_pt);
-                if (!ret)
-                        break;
+	if (strcmp(brickinfo->fstype, "zfs") != 0) {
+        	while (retry_count < 3) {
+                	retry_count++;
+                	/*umount2 system call doesn't cleanup mtab entry after un-mount.
+                  	So use external umount command*/
+                	ret = glusterd_umount(mount_pt);
+                	if (!ret)
+                        	break;
 
-                gf_log (this->name, GF_LOG_DEBUG, "umount failed for "
-                        "path %s (brick: %s): %s. Retry(%d)", mount_pt,
-                        brickinfo->path, strerror (errno), retry_count);
+                	gf_log (this->name, GF_LOG_DEBUG, "umount failed for "
+                        	"path %s (brick: %s): %s. Retry(%d)", mount_pt,
+                        	brickinfo->path, strerror (errno), retry_count);
 
-                sleep (1);
-        }
-        if (ret) {
-                gf_log (this->name, GF_LOG_ERROR, "umount failed for "
+                	sleep (1);
+        	}
+        	if (ret) {
+                	gf_log (this->name, GF_LOG_ERROR, "umount failed for "
                         "path %s (brick: %s): %s.", mount_pt,
                         brickinfo->path, strerror (errno));
-                goto out;
-        }
+                	goto out;
+        	}
+	}
 
         runinit (&runner);
-        snprintf (msg, sizeof(msg), "remove snapshot of the brick %s:%s, "
+	if (strcmp(brickinfo->fstype, "zfs") != 0) {
+        	snprintf (msg, sizeof(msg), "remove snapshot of the brick %s:%s, "
                   "device: %s", brickinfo->hostname, brickinfo->path,
                   snap_device);
+	} else {
+        	snprintf (msg, sizeof(msg), "remove snapshot of the brick %s:%s, "
+                  ,brickinfo->hostname, brickinfo->path);
+	}
 
 	if (strcmp(brickinfo->fstype, "zfs") != 0) {
 		runner_add_args (&runner, LVM_REMOVE, "-f", snap_device, NULL);
@@ -2334,9 +2343,16 @@ glusterd_do_lvm_snapshot_remove (glusterd_volinfo_t *snap_vol,
 
         ret = runner_run (&runner);
         if (ret) {
+	if (strcmp(brickinfo->fstype, "zfs") != 0) {
                 gf_log (this->name, GF_LOG_ERROR, "removing snapshot of the "
                         "brick (%s:%s) of device %s failed",
                         brickinfo->hostname, brickinfo->path, snap_device);
+	} else {
+                gf_log (this->name, GF_LOG_ERROR, "removing snapshot of the "
+                        "brick (%s:%s) failed",
+                        brickinfo->hostname, brickinfo->path);
+
+	}
                 goto out;
         }
 
@@ -2443,25 +2459,29 @@ glusterd_lvm_snapshot_remove (dict_t *rsp_dict, glusterd_volinfo_t *snap_vol)
                         continue;
                 }
 
-                if (strcmp (mnt_pt, brick_mount_path)) {
-                        gf_log (this->name, GF_LOG_DEBUG,
+		if (strcmp(brickinfo->fstype, "zfs") != 0) {
+                	if (strcmp (mnt_pt, brick_mount_path)) {
+                        	gf_log (this->name, GF_LOG_DEBUG,
                                 "Lvm is not mounted for brick %s:%s. "
                                 "Removing the brick path.",
                                 brickinfo->hostname, brickinfo->path);
-                        err = -1; /* We need to record this failure */
-                        goto remove_brick_path;
-                }
+                        	err = -1; /* We need to record this failure */
+                        	goto remove_brick_path;
+                	}
+		}
 
                 entry = glusterd_get_mnt_entry_info (mnt_pt, buff,
                                                     sizeof (buff), &save_entry);
-                if (!entry) {
-                        gf_log (this->name, GF_LOG_WARNING, "getting the mount"
+		if (strcmp(brickinfo->fstype, "zfs") != 0) {
+                	if (!entry) {
+                        	gf_log (this->name, GF_LOG_WARNING, "getting the mount"
                                 " entry for the brick %s:%s of the snap %s "
                                 "(volume: %s) failed", brickinfo->hostname,
                                 brickinfo->path, snap_vol->snapshot->snapname,
                                 snap_vol->volname);
-                        err = -1; /* We need to record this failure */
-                        goto remove_brick_path;
+                        	err = -1; /* We need to record this failure */
+                        	goto remove_brick_path;
+			}
                 }
                 ret = glusterd_do_lvm_snapshot_remove (snap_vol, brickinfo,
                                                        mnt_pt,
@@ -4198,24 +4218,23 @@ glusterd_snap_brick_create (glusterd_volinfo_t *snap_volinfo,
 	}
         ret = stat (brickinfo->path, &statbuf);
         if (ret) {
-                gf_log (this->name, GF_LOG_WARNING, "stat of the brick %s"
-                        "(brick mount: %s) failed (%s)", brickinfo->path,
-                        snap_brick_mount_path, strerror (errno));
-                goto out;
+               	gf_log (this->name, GF_LOG_WARNING, "stat of the brick %s"
+                       "(brick mount: %s) failed (%s)", brickinfo->path,
+                       snap_brick_mount_path, strerror (errno));
+               	goto out;
         }
         ret = sys_lsetxattr (brickinfo->path,
-                             GF_XATTR_VOL_ID_KEY,
-                             snap_volinfo->volume_id, 16,
-                             XATTR_REPLACE);
+                            GF_XATTR_VOL_ID_KEY,
+                            snap_volinfo->volume_id, 16,
+                            XATTR_REPLACE);
         if (ret == -1) {
-                gf_log (this->name, GF_LOG_ERROR, "Failed to set "
-                        "extended attribute %s on %s. Reason: "
-                        "%s, snap: %s", GF_XATTR_VOL_ID_KEY,
-                        brickinfo->path, strerror (errno),
-                        snap_volinfo->volname);
-                goto out;
+               	gf_log (this->name, GF_LOG_ERROR, "Failed to set "
+                       "extended attribute %s on %s. Reason: "
+                       "%s, snap: %s", GF_XATTR_VOL_ID_KEY,
+                       brickinfo->path, strerror (errno),
+                       snap_volinfo->volname);
+               	goto out;
         }
-
 out:
         if (ret) {
                 gf_log (this->name, GF_LOG_WARNING, "unmounting the snap brick"
