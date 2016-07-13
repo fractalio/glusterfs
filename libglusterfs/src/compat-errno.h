@@ -11,11 +11,6 @@
 #ifndef __COMPAT_ERRNO_H__
 #define __COMPAT_ERRNO_H__
 
-#ifndef _CONFIG_H
-#define _CONFIG_H
-#include "config.h"
-#endif
-
 #include <errno.h>
 
 #define GF_ERROR_CODE_SUCCESS         0
@@ -221,6 +216,11 @@
 #ifndef EBADFD
 #define EBADFD EBADRPC
 #endif /* EBADFD */
+
+#if !defined(ENODATA)
+/* This happens on FreeBSD.  Value borrowed from Linux. */
+#define ENODATA 61
+#endif
 
 /* These functions are defined for all the OS flags, but content will
  * be different for each OS flag.

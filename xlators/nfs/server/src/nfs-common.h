@@ -11,17 +11,12 @@
 #ifndef _NFS_COMMON_H_
 #define _NFS_COMMON_H_
 
-#ifndef _CONFIG_H
-#define _CONFIG_H
-#include "config.h"
-#endif
-
 #include <unistd.h>
 
 #include "xlator.h"
 #include "rpcsvc.h"
 #include "iatt.h"
-#include "uuid.h"
+#include "compat-uuid.h"
 
 //NFS_PATH_MAX hard-coded to 4096 as a work around for bug 2476.
 //nfs server crashes when path received is longer than PATH_MAX
@@ -42,9 +37,6 @@ nfs_path_to_xlator (xlator_list_t *cl, char *path);
 extern xlator_t *
 nfs_mntpath_to_xlator (xlator_list_t *cl, char *path);
 
-extern int
-nfs_zero_filled_stat (struct iatt *buf);
-
 extern void
 nfs_loc_wipe (loc_t *loc);
 
@@ -64,8 +56,8 @@ extern int
 nfs_ino_loc_fill (inode_table_t *itable, uuid_t gfid, loc_t *l);
 
 extern int
-nfs_entry_loc_fill (inode_table_t *itable, uuid_t pargfid, char *entry,
-                    loc_t *loc, int how);
+nfs_entry_loc_fill (xlator_t *this, inode_table_t *itable, uuid_t pargfid,
+                    char *entry, loc_t *loc, int how);
 
 extern int
 nfs_root_loc_fill (inode_table_t *itable, loc_t *loc);

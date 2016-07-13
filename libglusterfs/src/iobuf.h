@@ -19,6 +19,8 @@
 
 #define GF_VARIABLE_IOBUF_COUNT 32
 
+#define GF_RDMA_DEVICE_COUNT 8
+
 /* Lets try to define the new anonymous mapping
  * flag, in case the system is still using the
  * now deprecated MAP_ANON flag.
@@ -81,6 +83,7 @@ struct iobuf_arena {
                 };
         };
 
+        struct list_head    all_list;
         size_t              page_size;  /* size of all iobufs in this arena */
         size_t              arena_size; /* this is equal to
                                            (iobuf_pool->arena_size / page_size)
@@ -110,6 +113,7 @@ struct iobuf_pool {
         size_t              default_page_size; /* default size of iobuf */
 
         int                 arena_cnt;
+        struct list_head    all_arenas;
         struct list_head    arenas[GF_VARIABLE_IOBUF_COUNT];
         /* array of arenas. Each element of the array is a list of arenas
            holding iobufs of particular page_size */
@@ -121,7 +125,13 @@ struct iobuf_pool {
         /* array of of arenas which can be purged */
 
         uint64_t            request_misses; /* mostly the requests for higher
-                                               value of iobufs */
+                                              value of iobufs */
+        int                 rdma_device_count;
+        struct list_head    *mr_list[GF_RDMA_DEVICE_COUNT];
+        void                *device[GF_RDMA_DEVICE_COUNT];
+        int (*rdma_registration)(void **, void*);
+        int (*rdma_deregistration)(struct list_head**, struct iobuf_arena *);
+
 };
 
 
@@ -146,7 +156,7 @@ struct iobref {
 	int                used;
 };
 
-struct iobref *iobref_new ();
+struct iobref *iobref_new (void);
 struct iobref *iobref_ref (struct iobref *iobref);
 void iobref_unref (struct iobref *iobref);
 int iobref_add (struct iobref *iobref, struct iobuf *iobuf);
@@ -159,4 +169,8 @@ void   iobuf_stats_dump (struct iobuf_pool *iobuf_pool);
 
 struct iobuf *
 iobuf_get2 (struct iobuf_pool *iobuf_pool, size_t page_size);
+
+struct iobuf *
+iobuf_get_page_aligned (struct iobuf_pool *iobuf_pool, size_t page_size,
+                        size_t align_size);
 #endif /* !_IOBUF_H_ */

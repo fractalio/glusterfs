@@ -12,6 +12,7 @@
 #define _SERVER_HELPERS_H
 
 #include "server.h"
+#include "defaults.h"
 
 #define CALL_STATE(frame)   ((server_state_t *)frame->root->state)
 
@@ -57,4 +58,27 @@ int auth_set_username_passwd (dict_t *input_params, dict_t *config_params,
                               struct _client_t *client);
 
 server_ctx_t *server_ctx_get (client_t *client, xlator_t *xlator);
+int server_process_event_upcall (xlator_t *this, void *data);
+
+inode_t *
+server_inode_new (inode_table_t *itable, uuid_t gfid);
+
+int
+serialize_rsp_locklist (lock_migration_info_t *locklist,
+                                                 gfs3_getactivelk_rsp *rsp);
+
+int
+getactivelkinfo_rsp_cleanup (gfs3_getactivelk_rsp  *rsp);
+
+int
+server_populate_compound_response (xlator_t *this, gfs3_compound_rsp *rsp,
+                                   call_frame_t *frame,
+                                   compound_args_cbk_t *args_cbk, int index);
+int
+server_get_compound_resolve (server_state_t *state, gfs3_compound_req *req);
+
+int
+server_populate_compound_request (gfs3_compound_req *req, call_frame_t *frame,
+                                  default_args_t *this_args,
+                                  int index);
 #endif /* !_SERVER_HELPERS_H */

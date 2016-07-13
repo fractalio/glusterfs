@@ -16,7 +16,7 @@
 #include <setjmp.h>
 #include <inttypes.h>
 
-#include <cmockery/cmockery.h>
+#include <cmocka.h>
 
 int _gf_log (const char *domain, const char *file,
              const char *function, int32_t line, gf_loglevel_t level,
@@ -47,4 +47,4 @@ int _gf_msg_nomem (const char *domain, const char *file,
 }
 
 void
-gf_log_globals_init (void *data) {}
+gf_log_globals_init (void *data, gf_loglevel_t level) {}

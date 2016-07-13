@@ -1,6 +1,8 @@
 #!/bin/sh
 #
 # Copyright (c) 2013 Red Hat, Inc. <http://www.redhat.com>
+# Copyright (c) 2015 ungleich GmbH <http://www.ungleich.ch>
+#
 # This file is part of GlusterFS.
 #
 # This file is licensed to you under your choice of the GNU Lesser
@@ -10,7 +12,7 @@
 
 warn ()
 {
-   echo "$@" >/dev/stderr
+   echo "$@" >&2
 }
 
 _init ()
@@ -175,6 +177,10 @@ start_glusterfs ()
         cmd_line=$(echo "$cmd_line --aux-gfid-mount");
     fi
 
+    if [ -n "$resolve_gids" ]; then
+        cmd_line=$(echo "$cmd_line --resolve-gids");
+    fi
+
     if [ -n "$no_root_squash" ]; then
         cmd_line=$(echo "$cmd_line --no-root-squash");
     fi
@@ -222,6 +228,10 @@ start_glusterfs ()
 
     if [ -n "$cong_threshold" ]; then
         cmd_line=$(echo "$cmd_line --congestion-threshold=$cong_threshold");
+    fi
+
+    if [ -n "$oom_score_adj" ]; then
+        cmd_line=$(echo "$cmd_line --oom-score-adj=$oom_score_adj");
     fi
 
     if [ -n "$fuse_mountopts" ]; then
@@ -438,6 +448,9 @@ with_options()
         "congestion-threshold")
             cong_threshold=$value
             ;;
+        "oom-score-adj")
+            oom_score_adj=$value
+            ;;
         "xlator-option")
             xlator_option=$value
             ;;
@@ -461,6 +474,14 @@ with_options()
                 [ $value = "false" ] ; then
                 no_root_squash=1;
             fi ;;
+        "context"|"fscontext"|"defcontext"|"rootcontext")
+            # standard SElinux mount options to pass to the kernel
+            [ -z "$fuse_mountopts" ] || fuse_mountopts="$fuse_mountopts,"
+            fuse_mountopts="${fuse_mountopts}$key=\"$value\""
+            ;;
+        x-*)
+            # comments or userspace application-specific options, drop them
+            ;;
         *)
             warn "Invalid option: $key"
             exit 1
@@ -499,13 +520,35 @@ without_options()
                 aux_gfid_mount=1
             fi
             ;;
+        "resolve-gids")
+            resolve_gids=1
+            ;;
          # "mount -t glusterfs" sends this, but it's useless.
         "rw")
             ;;
+         # TODO: not sure how to handle this yet
+        "async"|"sync"|"dirsync"|\
+        "mand"|"nomand"|\
+        "silent"|"loud"|\
+        "iversion"|"noiversion"|\
+        "nofail")
+            warn "mount option '${option}' is not handled (yet?)"
+            ;;
+         # standard mount options to pass to the kernel
+        "atime"|"noatime"|"diratime"|"nodiratime"|\
+        "relatime"|"norelatime"|\
+        "strictatime"|"nostrictatime"|"lazyatime"|"nolazyatime"|\
+        "dev"|"nodev"|"exec"|"noexec"|"suid"|"nosuid")
+            [ -z "$fuse_mountopts" ] || fuse_mountopts="$fuse_mountopts,"
+            fuse_mountopts="${fuse_mountopts}${option}"
+            ;;
          # these ones are interpreted during system initialization
-        "noauto")
+        "auto"|"noauto")
             ;;
         "_netdev")
+            ;;
+        x-*)
+            # comments or userspace application-specific options, drop them
             ;;
         *)
             warn "Invalid option $option";
@@ -552,14 +595,16 @@ main ()
         ## `mount` specifies options as a last argument
         shift 2;
     fi
-    while getopts "Vo:hn" opt; do
+    while getopts "Vo:hns" opt; do
         case "${opt}" in
             o)
                 parse_options ${OPTARG};
 		shift 2;
                 ;;
             n)
-		shift 1;
+                ;;
+            s)
+                # accept+ignore sloppy mount, passed by autofs
                 ;;
             V)
                 ${cmd_line} -V;
@@ -582,27 +627,27 @@ main ()
     fi
 
     [ -r "$volfile_loc" ] || {
-        server_ip=$(echo "$volfile_loc" | sed -n 's/\([a-zA-Z0-9:.\-]*\):.*/\1/p');
+        # '%' included to support ipv6 link local addresses
+        server_ip=$(echo "$volfile_loc" | sed -n 's/\([a-zA-Z0-9:%.\-]*\):.*/\1/p');
         volume_str=$(echo "$volfile_loc" | sed -n 's/.*:\([^ ]*\).*/\1/p');
         [ -n "$volume_str" ] && {
             volume_id="$volume_str";
         }
         volfile_loc="";
-    }
-
-    [ -z "$volume_id" -o -z "$server_ip" ] && {
-        cat <<EOF >/dev/stderr
+        [ -z "$volume_id" -o -z "$server_ip" ] && {
+            cat <<EOF >&2
 ERROR: Server name/volume name unspecified cannot proceed further..
 Please specify correct format
 Usage:
 man 8 $0
 EOF
-        exit 1;
+            exit 1;
+        }
     }
 
     grep_ret=$(echo ${mount_point} | grep '^\-o');
     [ "x" != "x${grep_ret}" ] && {
-        cat <<EOF >/dev/stderr
+        cat <<EOF >&2
 ERROR: -o options cannot be specified in either first two arguments..
 Please specify correct style
 Usage:
@@ -614,7 +659,7 @@ EOF
     # No need to do a ! -d test, it is taken care while initializing the
     # variable mount_point
     [ -z "$mount_point" -o ! -d "$mount_point" ] && {
-        cat <<EOF >/dev/stderr
+        cat <<EOF >&2
 ERROR: Mount point does not exist
 Please specify a mount point
 Usage:

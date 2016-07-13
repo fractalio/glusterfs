@@ -29,11 +29,6 @@
 #include <semaphore.h>
 #include <errno.h>
 
-#ifndef _CONFIG_H
-#define _CONFIG_H
-#include "config.h"
-#endif
-
 #ifdef HAVE_MALLOC_H
 #include <malloc.h>
 #endif
@@ -114,7 +109,8 @@ glusterfs_ctx_defaults_init (glusterfs_ctx_t *ctx)
         if (!ctx->iobuf_pool)
                 return -1;
 
-        ctx->event_pool = event_pool_new (DEFAULT_EVENT_POOL_SIZE);
+        ctx->event_pool = event_pool_new (DEFAULT_EVENT_POOL_SIZE,
+                                          STARTING_EVENT_THREADS);
         if (!ctx->event_pool)
                 return -1;
 
@@ -150,11 +146,15 @@ glusterfs_ctx_defaults_init (glusterfs_ctx_t *ctx)
         if (!ctx->dict_data_pool)
                 return -1;
 
+        ctx->logbuf_pool = mem_pool_new (log_buf_t, 256);
+        if (!ctx->logbuf_pool)
+                return -1;
+
         INIT_LIST_HEAD (&pool->all_frames);
         LOCK_INIT (&pool->lock);
         ctx->pool = pool;
 
-        pthread_mutex_init (&(ctx->lock), NULL);
+        LOCK_INIT (&ctx->lock);
 
         cmd_args = &ctx->cmd_args;
 
@@ -360,12 +360,18 @@ cli_opt_parse (char *opt, struct cli_state *state)
                 state->log_file = oarg;
                 return 0;
         }
+        oarg = strtail (opt, "timeout=");
+        if (oarg) {
+                cli_default_conn_timeout = atoi(oarg);
+                return 0;
+        }
 
         oarg = strtail (opt, "log-level=");
         if (oarg) {
-                state->log_level = glusterd_check_log_level(oarg);
-                if (state->log_level == -1)
+                int log_level = glusterd_check_log_level(oarg);
+                if (log_level == -1)
                         return -1;
+                state->log_level = (gf_loglevel_t) log_level;
                 return 0;
         }
 
@@ -395,22 +401,28 @@ cli_opt_parse (char *opt, struct cli_state *state)
 int
 parse_cmdline (int argc, char *argv[], struct cli_state *state)
 {
-        int         ret = 0;
-        int         i = 0;
-        int         j = 0;
-        char        *opt = NULL;
+        int                 ret            = 0;
+        int                 i              = 0;
+        int                 j              = 0;
+        char               *opt            = NULL;
+        gf_boolean_t       geo_rep_config  = _gf_false;
 
         state->argc=argc-1;
         state->argv=&argv[1];
 
         /* Do this first so that an option can override. */
-        if (access(SECURE_ACCESS_FILE,F_OK) == 0) {
+        if (sys_access (SECURE_ACCESS_FILE, F_OK) == 0) {
                 state->ctx->secure_mgmt = 1;
         }
 
+        if (state->argc > GEO_REP_CMD_CONFIG_INDEX &&
+            strtail (state->argv[GEO_REP_CMD_INDEX], "geo") &&
+            strtail (state->argv[GEO_REP_CMD_CONFIG_INDEX], "co"))
+                geo_rep_config = _gf_true;
+
         for (i = 0; i < state->argc; i++) {
                 opt = strtail (state->argv[i], "--");
-                if (opt) {
+                if (opt && !geo_rep_config) {
                         ret = cli_opt_parse (opt, state);
                         if (ret == -1) {
                                 cli_out ("unrecognized option --%s", opt);
@@ -455,7 +467,7 @@ cli_state_init (struct cli_state *state)
         int                   ret = 0;
 
 
-        state->log_level = -1;
+        state->log_level = GF_LOG_NONE;
 
         tree = &state->tree;
         tree->state = state;
@@ -490,8 +502,10 @@ _cli_err (const char *fmt, ...)
         va_start (ap, fmt);
 
 #ifdef HAVE_READLINE
-        if (state->rl_enabled && !state->rl_processing)
-                return cli_rl_err(state, fmt, ap);
+        if (state->rl_enabled && !state->rl_processing) {
+                va_end (ap);
+                return cli_rl_err (state, fmt, ap);
+        }
 #endif
 
         ret = vfprintf (stderr, fmt, ap);
@@ -514,8 +528,10 @@ _cli_out (const char *fmt, ...)
         va_start (ap, fmt);
 
 #ifdef HAVE_READLINE
-        if (state->rl_enabled && !state->rl_processing)
-                return cli_rl_out(state, fmt, ap);
+        if (state->rl_enabled && !state->rl_processing) {
+                va_end (ap);
+                return cli_rl_out (state, fmt, ap);
+        }
 #endif
 
         ret = vprintf (fmt, ap);
@@ -547,7 +563,7 @@ cli_quotad_clnt_rpc_init (void)
                 goto out;
 
         ret = dict_set_str (rpc_opts, "transport.socket.connect-path",
-                                            "/tmp/quotad.socket");
+                                            "/var/run/gluster/quotad.socket");
         if (ret)
                 goto out;
 
@@ -620,7 +636,7 @@ cli_rpc_init (struct cli_state *state)
                         goto out;
         }
 
-        rpc = rpc_clnt_new (options, this->ctx, this->name, 16);
+        rpc = rpc_clnt_new (options, this, this->name, 16);
         if (!rpc)
                 goto out;
 
@@ -646,6 +662,8 @@ cli_local_get ()
         cli_local_t     *local = NULL;
 
         local = GF_CALLOC (1, sizeof (*local), cli_mt_cli_local_t);
+        LOCK_INIT (&local->lock);
+        INIT_LIST_HEAD (&local->dict_list);
 
         return local;
 }
@@ -690,6 +708,9 @@ main (int argc, char *argv[])
         if (ret)
                 goto out;
 
+        cli_default_conn_timeout = 120;
+        cli_ten_minutes_timeout = 600;
+
         ret = cli_state_init (&state);
         if (ret)
                 goto out;
@@ -704,6 +725,9 @@ main (int argc, char *argv[])
         ret = logging_init (ctx, &state);
         if (ret)
                 goto out;
+
+        gf_log ("cli", GF_LOG_INFO, "Started running %s with version %s",
+                argv[0], PACKAGE_VERSION);
 
         global_rpc = cli_rpc_init (&state);
         if (!global_rpc)
@@ -743,3 +767,35 @@ cli_print_line (int len)
 
         printf ("\n");
 }
+
+void
+print_quota_list_header (int type)
+{
+        if (type == GF_QUOTA_OPTION_TYPE_LIST) {
+                cli_out ("                  Path                   Hard-limit "
+                         " Soft-limit      Used  Available  Soft-limit "
+                         "exceeded? Hard-limit exceeded?");
+                cli_out ("-----------------------------------------------------"
+                         "-----------------------------------------------------"
+                         "---------------------");
+        } else {
+                cli_out ("                  Path                   Hard-limit  "
+                         " Soft-limit      Files       Dirs     Available  "
+                         "Soft-limit exceeded? Hard-limit exceeded?");
+                cli_out ("-----------------------------------------------------"
+                         "-----------------------------------------------------"
+                         "-------------------------------------");
+        }
+}
+
+void
+print_quota_list_empty (char *path, int type)
+{
+        if (type == GF_QUOTA_OPTION_TYPE_LIST)
+                cli_out ("%-40s %7s %9s %10s %7s %15s %20s", path,
+                         "N/A", "N/A", "N/A", "N/A", "N/A", "N/A");
+        else
+                cli_out ("%-40s %9s %9s %12s %10s %10s %15s %20s", path,
+                         "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A");
+}
+

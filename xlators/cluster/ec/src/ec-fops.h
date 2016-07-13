@@ -16,9 +16,6 @@
 #include "ec-data.h"
 #include "ec-common.h"
 
-#define EC_FOP_HEAL     -1
-#define EC_FOP_FHEAL    -2
-
 void ec_access(call_frame_t * frame, xlator_t * this, uintptr_t target,
                int32_t minimum, fop_access_cbk_t func, void *data, loc_t * loc,
                int32_t mask, dict_t * xdata);
@@ -197,5 +194,9 @@ void ec_fxattrop(call_frame_t * frame, xlator_t * this, uintptr_t target,
                  int32_t minimum, fop_fxattrop_cbk_t func, void *data,
                  fd_t * fd, gf_xattrop_flags_t optype, dict_t * xattr,
                  dict_t * xdata);
+
+void ec_seek(call_frame_t *frame, xlator_t *this, uintptr_t target,
+             int32_t minimum, fop_seek_cbk_t func, void *data, fd_t *fd,
+             off_t offset, gf_seek_what_t what, dict_t *xdata);
 
 #endif /* __EC_FOPS_H__ */

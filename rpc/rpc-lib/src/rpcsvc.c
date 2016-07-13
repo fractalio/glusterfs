@@ -8,11 +8,6 @@
   cases as published by the Free Software Foundation.
 */
 
-#ifndef _CONFIG_H
-#define _CONFIG_H
-#include "config.h"
-#endif
-
 #include "rpcsvc.h"
 #include "rpc-transport.h"
 #include "dict.h"
@@ -179,13 +174,25 @@ rpcsvc_can_outstanding_req_be_ignored (rpcsvc_request_t *req)
 int
 rpcsvc_request_outstanding (rpcsvc_request_t *req, int delta)
 {
-        int ret = 0;
-        int old_count = 0;
-        int new_count = 0;
-        int limit = 0;
+        int             ret = -1;
+        int             old_count = 0;
+        int             new_count = 0;
+        int             limit = 0;
+        gf_boolean_t    throttle = _gf_false;
 
-        if (rpcsvc_can_outstanding_req_be_ignored (req))
-                return 0;
+        if (!req)
+                goto out;
+
+        throttle = rpcsvc_get_throttle (req->svc);
+        if (!throttle) {
+                ret = 0;
+                goto out;
+        }
+
+        if (rpcsvc_can_outstanding_req_be_ignored (req)) {
+                ret = 0;
+                goto out;
+        }
 
         pthread_mutex_lock (&req->trans->lock);
         {
@@ -206,6 +213,7 @@ rpcsvc_request_outstanding (rpcsvc_request_t *req, int delta)
 unlock:
         pthread_mutex_unlock (&req->trans->lock);
 
+out:
         return ret;
 }
 
@@ -312,7 +320,7 @@ err:
 /* this procedure can only pass 4 arguments to registered notifyfn. To send more
  * arguments call wrapper->notify directly.
  */
-static inline void
+static void
 rpcsvc_program_notify (rpcsvc_listener_t *listener, rpcsvc_event_t event,
                        void *data)
 {
@@ -335,7 +343,7 @@ out:
 }
 
 
-static inline int
+static int
 rpcsvc_accept (rpcsvc_t *svc, rpc_transport_t *listen_trans,
                rpc_transport_t *new_trans)
 {
@@ -603,7 +611,7 @@ rpcsvc_handle_rpc_call (rpcsvc_t *svc, rpc_transport_t *trans,
 
                 gf_log ("rpcsvc", GF_LOG_TRACE, "Client port: %d", (int)port);
 
-                if (port > 1024)
+                if (port >= 1024)
                         unprivileged = _gf_true;
         }
 
@@ -622,9 +630,12 @@ rpcsvc_handle_rpc_call (rpcsvc_t *svc, rpc_transport_t *trans,
                         /* Non-privileged user, fail request */
                         gf_log (GF_RPCSVC, GF_LOG_ERROR,
                                 "Request received from non-"
-                                "privileged port. Failing request");
-                        rpcsvc_request_destroy (req);
-                        return -1;
+                                "privileged port. Failing request for %s.",
+                                req->trans->peerinfo.identifier);
+                        req->rpc_status = MSG_DENIED;
+                        req->rpc_err = AUTH_ERROR;
+                        req->auth_err = RPCSVC_AUTH_REJECT;
+                        goto err_reply;
         }
 
         /* DRC */
@@ -664,7 +675,7 @@ rpcsvc_handle_rpc_call (rpcsvc_t *svc, rpc_transport_t *trans,
 
         if (req->rpc_err == SUCCESS) {
                 /* Before going to xlator code, set the THIS properly */
-                THIS = svc->mydata;
+                THIS = svc->xl;
 
                 actor_fn = actor->actor;
 
@@ -985,6 +996,48 @@ out:
         return request_iob;
 }
 
+int rpcsvc_request_submit (rpcsvc_t *rpc, rpc_transport_t *trans,
+                           rpcsvc_cbk_program_t *prog, int procnum,
+                           void *req, glusterfs_ctx_t *ctx,
+                           xdrproc_t xdrproc)
+{
+        int                     ret         = -1;
+        int                     count       = 0;
+        struct iovec            iov         = {0, };
+        struct iobuf            *iobuf      = NULL;
+        ssize_t                 xdr_size    = 0;
+
+        if (!req)
+                goto out;
+
+        xdr_size = xdr_sizeof (xdrproc, req);
+
+        iobuf = iobuf_get2 (ctx->iobuf_pool, xdr_size);
+        if (!iobuf)
+                goto out;
+
+        iov.iov_base = iobuf->ptr;
+        iov.iov_len  = iobuf_pagesize (iobuf);
+
+        ret = xdr_serialize_generic (iov, req, xdrproc);
+        if (ret == -1) {
+                gf_log (THIS->name, GF_LOG_WARNING,
+                        "failed to create XDR payload");
+                goto out;
+        }
+        iov.iov_len = ret;
+        count = 1;
+
+        ret = rpcsvc_callback_submit (rpc, trans, prog, procnum,
+                                      &iov, count);
+
+out:
+        if (iobuf)
+                iobuf_unref (iobuf);
+
+        return ret;
+}
+
 int
 rpcsvc_callback_submit (rpcsvc_t *rpc, rpc_transport_t *trans,
                         rpcsvc_cbk_program_t *prog, int procnum,
@@ -1297,7 +1350,7 @@ rpcsvc_error_reply (rpcsvc_request_t *req)
 
 
 /* Register the program with the local portmapper service. */
-inline int
+int
 rpcsvc_program_register_portmap (rpcsvc_program_t *newprog, uint32_t port)
 {
         int                ret   = -1; /* FAIL */
@@ -1320,7 +1373,7 @@ out:
 }
 
 
-inline int
+int
 rpcsvc_program_unregister_portmap (rpcsvc_program_t *prog)
 {
         int ret = -1;
@@ -1489,16 +1542,22 @@ rpcsvc_program_unregister (rpcsvc_t *svc, rpcsvc_program_t *program)
         ret = 0;
 out:
         if (ret == -1) {
-                gf_log (GF_RPCSVC, GF_LOG_ERROR, "Program unregistration failed"
-                        ": %s, Num: %d, Ver: %d, Port: %d", program->progname,
-                        program->prognum, program->progver, program->progport);
+                if (program) {
+                        gf_log (GF_RPCSVC, GF_LOG_ERROR, "Program "
+                                "unregistration failed"
+                                ": %s, Num: %d, Ver: %d, Port: %d",
+                                program->progname, program->prognum,
+                                program->progver, program->progport);
+                } else {
+                        gf_log (GF_RPCSVC, GF_LOG_ERROR, "Program not found");
+                }
         }
 
         return ret;
 }
 
 
-inline int
+int
 rpcsvc_transport_peername (rpc_transport_t *trans, char *hostname, int hostlen)
 {
         if (!trans) {
@@ -1509,7 +1568,7 @@ rpcsvc_transport_peername (rpc_transport_t *trans, char *hostname, int hostlen)
 }
 
 
-inline int
+int
 rpcsvc_transport_peeraddr (rpc_transport_t *trans, char *addrstr, int addrlen,
                            struct sockaddr_storage *sa, socklen_t sasize)
 {
@@ -1519,43 +1578,6 @@ rpcsvc_transport_peeraddr (rpc_transport_t *trans, char *addrstr, int addrlen,
 
         return rpc_transport_get_peeraddr(trans, addrstr, addrlen, sa,
                                           sasize);
-}
-
-
-rpc_transport_t *
-rpcsvc_transport_create (rpcsvc_t *svc, dict_t *options, char *name)
-{
-        int                ret   = -1;
-        rpc_transport_t   *trans = NULL;
-
-        trans = rpc_transport_load (svc->ctx, options, name);
-        if (!trans) {
-                gf_log (GF_RPCSVC, GF_LOG_WARNING, "cannot create listener, "
-                        "initing the transport failed");
-                goto out;
-        }
-
-        ret = rpc_transport_listen (trans);
-        if (ret == -1) {
-                gf_log (GF_RPCSVC, GF_LOG_WARNING,
-                        "listening on transport failed");
-                goto out;
-        }
-
-        ret = rpc_transport_register_notify (trans, rpcsvc_notify, svc);
-        if (ret == -1) {
-                gf_log (GF_RPCSVC, GF_LOG_WARNING, "registering notify failed");
-                goto out;
-        }
-
-        ret = 0;
-out:
-        if ((ret == -1) && (trans)) {
-                rpc_transport_disconnect (trans);
-                trans = NULL;
-        }
-
-        return trans;
 }
 
 rpcsvc_listener_t *
@@ -1595,9 +1617,23 @@ rpcsvc_create_listener (rpcsvc_t *svc, dict_t *options, char *name)
                 goto out;
         }
 
-        trans = rpcsvc_transport_create (svc, options, name);
+        trans = rpc_transport_load (svc->ctx, options, name);
         if (!trans) {
-                /* LOG TODO */
+                gf_log (GF_RPCSVC, GF_LOG_WARNING, "cannot create listener, "
+                        "initing the transport failed");
+                goto out;
+        }
+
+        ret = rpc_transport_listen (trans);
+        if (ret == -EADDRINUSE || ret == -1) {
+                gf_log (GF_RPCSVC, GF_LOG_WARNING,
+                        "listening on transport failed");
+                goto out;
+        }
+
+        ret = rpc_transport_register_notify (trans, rpcsvc_notify, svc);
+        if (ret == -1) {
+                gf_log (GF_RPCSVC, GF_LOG_WARNING, "registering notify failed");
                 goto out;
         }
 
@@ -1700,7 +1736,11 @@ out:
 
         GF_FREE (transport_name);
 
-        return count;
+        if (count > 0) {
+                return count;
+        } else {
+                return ret;
+        }
 }
 
 
@@ -1741,7 +1781,7 @@ rpcsvc_register_notify (rpcsvc_t *svc, rpcsvc_notify_t notify, void *mydata)
         if (!wrapper) {
                 goto out;
         }
-        svc->mydata   = mydata;  /* this_xlator */
+        svc->mydata   = mydata;
         wrapper->data = mydata;
         wrapper->notify = notify;
 
@@ -1758,7 +1798,7 @@ out:
 }
 
 
-inline int
+int
 rpcsvc_program_register (rpcsvc_t *svc, rpcsvc_program_t *program)
 {
         int               ret                = -1;
@@ -1845,21 +1885,28 @@ build_prog_details (rpcsvc_request_t *req, gf_dump_rsp *rsp)
         if (!req || !req->trans || !req->svc)
                 goto out;
 
-        list_for_each_entry (program, &req->svc->programs, program) {
-                prog = GF_CALLOC (1, sizeof (*prog), 0);
-                if (!prog)
-                        goto out;
-                prog->progname = program->progname;
-                prog->prognum  = program->prognum;
-                prog->progver  = program->progver;
-                if (!rsp->prog)
-                        rsp->prog = prog;
+        pthread_mutex_lock (&req->svc->rpclock);
+        {
+                list_for_each_entry (program, &req->svc->programs, program) {
+                        prog = GF_CALLOC (1, sizeof (*prog), 0);
+                        if (!prog)
+                                goto unlock;
+
+                        prog->progname = program->progname;
+                        prog->prognum  = program->prognum;
+                        prog->progver  = program->progver;
+
+                        if (!rsp->prog)
+                                rsp->prog = prog;
+                        if (prev)
+                                prev->next = prog;
+                        prev = prog;
+                }
                 if (prev)
-                        prev->next = prog;
-                prev = prog;
+                        ret = 0;
         }
-        if (prev)
-                ret = 0;
+unlock:
+        pthread_mutex_unlock (&req->svc->rpclock);
 out:
         return ret;
 }
@@ -1984,7 +2031,7 @@ rpcsvc_reconfigure_options (rpcsvc_t *svc, dict_t *options)
                 return (-1);
 
         /* Fetch the xlator from svc */
-        xlator = (xlator_t *) svc->mydata;
+        xlator = svc->xl;
         if (!xlator)
                 return (-1);
 
@@ -2155,6 +2202,52 @@ rpcsvc_set_outstanding_rpc_limit (rpcsvc_t *svc, dict_t *options, int defvalue)
         return (0);
 }
 
+/*
+ * Enable throttling for rpcsvc_t svc.
+ * Returns 0 on success, -1 otherwise.
+ */
+int
+rpcsvc_set_throttle_on (rpcsvc_t *svc)
+{
+
+        if (!svc)
+                return -1;
+
+        svc->throttle = _gf_true;
+
+        return 0;
+}
+
+/*
+ * Disable throttling for rpcsvc_t svc.
+ * Returns 0 on success, -1 otherwise.
+ */
+int
+rpcsvc_set_throttle_off (rpcsvc_t *svc)
+{
+
+        if (!svc)
+                return -1;
+
+        svc->throttle = _gf_false;
+
+        return 0;
+}
+
+/*
+ * Get throttle state for rpcsvc_t svc.
+ * Returns value of attribute throttle on success, _gf_false otherwise.
+ */
+gf_boolean_t
+rpcsvc_get_throttle (rpcsvc_t *svc)
+{
+
+        if (!svc)
+                return _gf_false;
+
+        return svc->throttle;
+}
+
 /* The global RPC service initializer.
  */
 rpcsvc_t *
@@ -2204,7 +2297,7 @@ rpcsvc_init (xlator_t *xl, glusterfs_ctx_t *ctx, dict_t *options,
         ret = -1;
         svc->options = options;
         svc->ctx = ctx;
-        svc->mydata = xl;
+        svc->xl = xl;
         gf_log (GF_RPCSVC, GF_LOG_DEBUG, "RPC service inited.");
 
         gluster_dump_prog.options = options;

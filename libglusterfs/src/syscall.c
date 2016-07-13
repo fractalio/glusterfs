@@ -8,18 +8,16 @@
   cases as published by the Free Software Foundation.
 */
 
-#ifndef _CONFIG_H
-#define _CONFIG_H
-#include "config.h"
-#endif
-
-#include "compat.h"
 #include "syscall.h"
+#include "compat.h"
+#include "mem-pool.h"
 
 #include <sys/types.h>
 #include <utime.h>
 #include <sys/time.h>
 #include <fcntl.h>
+#include <unistd.h>
+#include <stdarg.h>
 
 int
 sys_lstat (const char *path, struct stat *buf)
@@ -273,6 +271,34 @@ sys_write (int fd, const void *buf, size_t count)
 }
 
 
+ssize_t
+sys_preadv (int fd, const struct iovec *iov, int iovcnt, off_t offset)
+{
+        return preadv (fd, iov, iovcnt, offset);
+}
+
+
+ssize_t
+sys_pwritev (int fd, const struct iovec *iov, int iovcnt, off_t offset)
+{
+        return pwritev (fd, iov, iovcnt, offset);
+}
+
+
+ssize_t
+sys_pread (int fd, void *buf, size_t count, off_t offset)
+{
+        return pread (fd, buf, count, offset);
+}
+
+
+ssize_t
+sys_pwrite (int fd, const void *buf, size_t count, off_t offset)
+{
+        return pwrite (fd, buf, count, offset);
+}
+
+
 off_t
 sys_lseek (int fd, off_t offset, int whence)
 {
@@ -324,7 +350,7 @@ gf_add_prefix(const char *ns, const char *key, char **newkey)
         /* if we dont have any namespace, append USER NS */
         if (strncmp(key, XATTR_USER_PREFIX,     XATTR_USER_PREFIX_LEN) &&
             strncmp(key, XATTR_TRUSTED_PREFIX,  XATTR_TRUSTED_PREFIX_LEN) &&
-            strncmp(key, XATTR_SECURITY_PREFIX, XATTR_TRUSTED_PREFIX_LEN) &&
+            strncmp(key, XATTR_SECURITY_PREFIX, XATTR_SECURITY_PREFIX_LEN) &&
             strncmp(key, XATTR_SYSTEM_PREFIX,   XATTR_SYSTEM_PREFIX_LEN)) {
                 int ns_length =  strlen(ns);
                 *newkey = GF_MALLOC(ns_length + strlen(key) + 10,
@@ -564,7 +590,7 @@ sys_fallocate(int fd, int mode, off_t offset, off_t len)
         return posix_fallocate(fd, offset, len);
 #endif
 
-#if defined(F_ALLOCATECONFIG) && defined(GF_DARWIN_HOST_OS)
+#if defined(F_ALLOCATECONTIG) && defined(GF_DARWIN_HOST_OS)
         /* C conversion from C++ implementation for OSX by Mozilla Foundation */
         if (mode) {
                 /* keep size not supported */

@@ -11,11 +11,6 @@
 #ifndef _FD_H
 #define _FD_H
 
-#ifndef _CONFIG_H
-#define _CONFIG_H
-#include "config.h"
-#endif
-
 #include "list.h"
 #include <sys/types.h>
 #include <unistd.h>
@@ -25,6 +20,7 @@
 #include "common-utils.h"
 
 #define GF_ANON_FD_NO -2
+#define GF_ANON_FD_FLAGS (O_RDWR|O_LARGEFILE)
 
 struct _inode;
 struct _dict;
@@ -52,7 +48,9 @@ struct _fd {
 	struct _fd_ctx   *_ctx;
         int               xl_count; /* Number of xl referred in this fd */
         struct fd_lk_ctx *lk_ctx;
-        gf_boolean_t      anonymous; /* geo-rep anonymous fd */
+        gf_boolean_t      anonymous; /* fd which does not have counterpart open
+                                        fd on backend (server for client, posix
+                                        for server). */
 };
 typedef struct _fd fd_t;
 
@@ -135,11 +133,13 @@ fd_t *
 fd_lookup_uint64 (struct _inode *inode, uint64_t pid);
 
 fd_t*
-fd_lookup_anonymous (inode_t *inode);
+fd_lookup_anonymous (inode_t *inode, int32_t flags);
 
 fd_t *
 fd_anonymous (inode_t *inode);
 
+fd_t *
+fd_anonymous_with_flags (inode_t *inode, int32_t flags);
 
 gf_boolean_t
 fd_is_anonymous (fd_t *fd);

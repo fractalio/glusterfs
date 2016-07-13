@@ -10,13 +10,8 @@
 #ifndef _GLUSTERD_HA_H_
 #define _GLUSTERD_HA_H_
 
-#ifndef _CONFIG_H
-#define _CONFIG_H
-#include "config.h"
-#endif
-
 #include <pthread.h>
-#include "uuid.h"
+#include "compat-uuid.h"
 
 #include "glusterfs.h"
 #include "xlator.h"
@@ -46,6 +41,7 @@ typedef enum glusterd_store_ver_ac_{
 #define GLUSTERD_STORE_KEY_VOL_REPLICA_CNT      "replica_count"
 #define GLUSTERD_STORE_KEY_VOL_DISPERSE_CNT     "disperse_count"
 #define GLUSTERD_STORE_KEY_VOL_REDUNDANCY_CNT   "redundancy_count"
+#define GLUSTERD_STORE_KEY_VOL_ARBITER_CNT      "arbiter_count"
 #define GLUSTERD_STORE_KEY_VOL_BRICK            "brick"
 #define GLUSTERD_STORE_KEY_VOL_VERSION          "version"
 #define GLUSTERD_STORE_KEY_VOL_TRANSPORT        "transport-type"
@@ -63,6 +59,16 @@ typedef enum glusterd_store_ver_ac_{
 #define GLUSTERD_STORE_KEY_PARENT_VOLNAME       "parent_volname"
 #define GLUSTERD_STORE_KEY_VOL_OP_VERSION       "op-version"
 #define GLUSTERD_STORE_KEY_VOL_CLIENT_OP_VERSION "client-op-version"
+#define GLUSTERD_STORE_KEY_VOL_QUOTA_VERSION    "quota-version"
+
+#define GLUSTERD_STORE_KEY_COLD_TYPE            "cold_type"
+#define GLUSTERD_STORE_KEY_COLD_COUNT           "cold_count"
+#define GLUSTERD_STORE_KEY_COLD_REPLICA_COUNT   "cold_replica_count"
+#define GLUSTERD_STORE_KEY_COLD_DISPERSE_COUNT  "cold_disperse_count"
+#define GLUSTERD_STORE_KEY_COLD_REDUNDANCY_COUNT  "cold_redundancy_count"
+#define GLUSTERD_STORE_KEY_HOT_TYPE             "hot_type"
+#define GLUSTERD_STORE_KEY_HOT_COUNT            "hot_count"
+#define GLUSTERD_STORE_KEY_HOT_REPLICA_COUNT    "hot_replica_count"
 
 #define GLUSTERD_STORE_KEY_SNAP_NAME            "name"
 #define GLUSTERD_STORE_KEY_SNAP_ID              "snap-id"
@@ -75,9 +81,11 @@ typedef enum glusterd_store_ver_ac_{
 #define GLUSTERD_STORE_KEY_SNAP_MAX_SOFT_LIMIT  "snap-max-soft-limit"
 #define GLUSTERD_STORE_KEY_SNAPD_PORT           "snapd-port"
 #define GLUSTERD_STORE_KEY_SNAP_ACTIVATE        "snap-activate-on-create"
+#define GLUSTERD_STORE_KEY_GANESHA_GLOBAL       "nfs-ganesha"
 
 #define GLUSTERD_STORE_KEY_BRICK_HOSTNAME       "hostname"
 #define GLUSTERD_STORE_KEY_BRICK_PATH           "path"
+#define GLUSTERD_STORE_KEY_BRICK_REAL_PATH      "real_path"
 #define GLUSTERD_STORE_KEY_BRICK_PORT           "listen-port"
 #define GLUSTERD_STORE_KEY_BRICK_RDMA_PORT      "rdma.listen-port"
 #define GLUSTERD_STORE_KEY_BRICK_DECOMMISSIONED "decommissioned"
@@ -95,19 +103,12 @@ typedef enum glusterd_store_ver_ac_{
 
 #define GLUSTERD_STORE_KEY_VOL_CAPS             "caps"
 
-#define glusterd_for_each_entry(entry, dir) \
-        do {\
-                entry = NULL;\
-                if (dir) {\
-                        entry = readdir (dir);\
-                        while (entry && (!strcmp (entry->d_name, ".") ||\
-                            !fnmatch ("*.tmp", entry->d_name, 0) ||\
-                            !strcmp (entry->d_name, ".."))) {\
-                                entry = readdir (dir);\
-                        }\
-                }\
-        } while (0); \
-
+#define GLUSTERD_STORE_KEY_VOL_DEFRAG_REB_FILES "rebalanced-files"
+#define GLUSTERD_STORE_KEY_VOL_DEFRAG_SIZE      "size"
+#define GLUSTERD_STORE_KEY_VOL_DEFRAG_SCANNED   "scanned"
+#define GLUSTERD_STORE_KEY_VOL_DEFRAG_FAILURES  "failures"
+#define GLUSTERD_STORE_KEY_VOL_DEFRAG_SKIPPED   "skipped"
+#define GLUSTERD_STORE_KEY_VOL_DEFRAG_RUN_TIME  "run-time"
 
 int32_t
 glusterd_store_volinfo (glusterd_volinfo_t *volinfo, glusterd_volinfo_ver_ac_t ac);
@@ -181,4 +182,14 @@ glusterd_store_update_missed_snaps ();
 
 glusterd_volinfo_t*
 glusterd_store_retrieve_volume (char *volname, glusterd_snap_t *snap);
+
+int
+glusterd_restore_op_version (xlator_t *this);
+
+int32_t
+glusterd_quota_conf_write_header (int fd);
+
+int32_t
+glusterd_quota_conf_write_gfid (int fd, void *buf, char type);
+
 #endif

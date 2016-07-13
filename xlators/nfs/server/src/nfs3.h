@@ -11,11 +11,6 @@
 #ifndef _NFS3_H_
 #define _NFS3_H_
 
-#ifndef _CONFIG_H
-#define _CONFIG_H
-#include "config.h"
-#endif
-
 #include "rpcsvc.h"
 #include "dict.h"
 #include "xlator.h"
@@ -230,9 +225,10 @@ struct nfs3_local {
         cookie3                 cookie;
         struct iovec            datavec;
         mode_t                  mode;
+        struct iatt             attr_in;
 
         /* NFSv3 FH resolver state */
-	int			hardresolved;
+        int                     hardresolved;
         struct nfs3_fh          resolvefh;
         loc_t                   resolvedloc;
         int                     resolve_ret;

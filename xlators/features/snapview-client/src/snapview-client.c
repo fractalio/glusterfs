@@ -8,17 +8,12 @@
    cases as published by the Free Software Foundation.
 */
 
-#ifndef _CONFIG_H
-#define _CONFIG_H
-#include "config.h"
-#endif
-
 #include "snapview-client.h"
 #include "inode.h"
 #include "byte-order.h"
 
 
-void
+static void
 svc_local_free (svc_local_t *local)
 {
         if (local) {
@@ -31,7 +26,7 @@ svc_local_free (svc_local_t *local)
         }
 }
 
-xlator_t *
+static xlator_t *
 svc_get_subvolume (xlator_t *this, int inode_type)
 {
         xlator_t *subvolume = NULL;
@@ -47,7 +42,7 @@ out:
         return subvolume;
 }
 
-int32_t
+static int32_t
 __svc_inode_ctx_set (xlator_t *this, inode_t *inode, int inode_type)
 {
         uint64_t    value = 0;
@@ -64,7 +59,7 @@ out:
         return ret;
 }
 
-int
+static int
 __svc_inode_ctx_get (xlator_t *this, inode_t *inode, int *inode_type)
 {
         uint64_t    value      = 0;
@@ -83,7 +78,7 @@ out:
         return ret;
 }
 
-int
+static int
 svc_inode_ctx_get (xlator_t *this, inode_t *inode, int *inode_type)
 {
         int          ret        = -1;
@@ -101,7 +96,7 @@ out:
         return ret;
 }
 
-int32_t
+static int32_t
 svc_inode_ctx_set (xlator_t *this, inode_t *inode, int inode_type)
 {
         int32_t   ret = -1;
@@ -119,7 +114,7 @@ out:
         return ret;
 }
 
-svc_fd_t *
+static svc_fd_t *
 svc_fd_new (void)
 {
         svc_fd_t    *svc_fd = NULL;
@@ -129,7 +124,7 @@ svc_fd_new (void)
         return svc_fd;
 }
 
-svc_fd_t *
+static svc_fd_t *
 __svc_fd_ctx_get (xlator_t *this, fd_t *fd)
 {
         svc_fd_t *svc_fd = NULL;
@@ -149,7 +144,7 @@ out:
         return svc_fd;
 }
 
-svc_fd_t *
+static svc_fd_t *
 svc_fd_ctx_get (xlator_t *this, fd_t *fd)
 {
         svc_fd_t *svc_fd = NULL;
@@ -167,7 +162,7 @@ out:
         return svc_fd;
 }
 
-int
+static int
 __svc_fd_ctx_set (xlator_t *this, fd_t *fd, svc_fd_t *svc_fd)
 {
         uint64_t    value = 0;
@@ -185,26 +180,7 @@ out:
         return ret;
 }
 
-int32_t
-svc_fd_ctx_set (xlator_t *this, fd_t *fd, svc_fd_t *svc_fd)
-{
-        int32_t    ret = -1;
-
-        GF_VALIDATE_OR_GOTO ("snapview-client", this, out);
-        GF_VALIDATE_OR_GOTO (this->name, fd, out);
-        GF_VALIDATE_OR_GOTO (this->name, svc_fd, out);
-
-        LOCK (&fd->lock);
-        {
-                ret = __svc_fd_ctx_set (this, fd, svc_fd);
-        }
-        UNLOCK (&fd->lock);
-
-out:
-        return ret;
-}
-
-svc_fd_t *
+static svc_fd_t *
 __svc_fd_ctx_get_or_new (xlator_t *this, fd_t *fd)
 {
         svc_fd_t        *svc_fd    = NULL;
@@ -244,7 +220,7 @@ out:
         return svc_fd;
 }
 
-svc_fd_t *
+static svc_fd_t *
 svc_fd_ctx_get_or_new (xlator_t *this, fd_t *fd)
 {
         svc_fd_t  *svc_fd = NULL;
@@ -263,17 +239,15 @@ out:
 }
 
 
-int32_t
-svc_lookup_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
-                int32_t op_ret, int32_t op_errno, inode_t *inode,
-                struct iatt *buf, dict_t *xdata, struct iatt *postparent)
+static int32_t
+gf_svc_lookup_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
+                   int32_t op_ret, int32_t op_errno, inode_t *inode,
+                   struct iatt *buf, dict_t *xdata, struct iatt *postparent)
 {
         svc_local_t     *local       = NULL;
-        inode_t         *parent      = NULL;
         xlator_t        *subvolume   = NULL;
         gf_boolean_t     do_unwind   = _gf_true;
         int              inode_type  = -1;
-        int              parent_type = -1;
         int              ret         = -1;
 
         local = frame->local;
@@ -313,47 +287,30 @@ svc_lookup_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
                                 ? GF_LOG_DEBUG:GF_LOG_ERROR,
                                 "Lookup failed on snapview graph with error %s",
                                 strerror (op_errno));
+                        goto out;
                 }
 
                 if ((op_errno == ENOENT || op_errno == ESTALE) &&
-                    !uuid_is_null (local->loc.gfid)) {
-                        ret = svc_inode_ctx_get (this, inode, &inode_type);
-                        if (ret < 0 && subvolume == FIRST_CHILD (this)) {
+                    !gf_uuid_is_null (local->loc.gfid)) {
+                        if (inode != NULL)
+                                ret = svc_inode_ctx_get (this, inode,
+                                                                &inode_type);
+
+                        if (ret < 0 || inode == NULL) {
                                 gf_log (this->name, GF_LOG_DEBUG,
                                         "Lookup on normal graph failed. "
                                         "Sending lookup to snapview-server");
 
                                 subvolume = SECOND_CHILD (this);
                                 local->subvolume = subvolume;
-                                STACK_WIND (frame, svc_lookup_cbk, subvolume,
-                                            subvolume->fops->lookup,
+                                STACK_WIND (frame, gf_svc_lookup_cbk,
+                                            subvolume, subvolume->fops->lookup,
                                             &local->loc, xdata);
                                 do_unwind = _gf_false;
                         }
                 }
 
                 goto out;
-        }
-
-        if (local->loc.parent)
-                parent = inode_ref (local->loc.parent);
-        else {
-                parent = inode_parent (inode, NULL, NULL);
-                if (!parent && !uuid_is_null (local->loc.pargfid)) {
-                        parent = inode_find (inode->table,
-                                             local->loc.pargfid);
-                }
-        }
-
-        if (!__is_root_gfid (buf->ia_gfid) && parent) {
-                ret = svc_inode_ctx_get (this, parent, &parent_type);
-                if (ret < 0) {
-                        op_ret = -1;
-                        op_errno = EINVAL;
-                        gf_log (this->name, GF_LOG_WARNING,
-                                "Error fetching parent context");
-                        goto out;
-                }
         }
 
         if (subvolume == FIRST_CHILD (this))
@@ -372,15 +329,11 @@ out:
                                   xdata, postparent);
         }
 
-        if (parent)
-                inode_unref (parent);
-
         return 0;
 }
 
-int32_t
-svc_lookup (call_frame_t *frame, xlator_t *this, loc_t *loc,
-            dict_t *xdata)
+static int32_t
+gf_svc_lookup (call_frame_t *frame, xlator_t *this, loc_t *loc, dict_t *xdata)
 {
         int32_t        ret         =   -1;
         svc_local_t   *local       = NULL;
@@ -443,7 +396,7 @@ svc_lookup (call_frame_t *frame, xlator_t *this, loc_t *loc,
         */
 
         if (!loc->name) {
-                if (uuid_is_null (loc->inode->gfid)) {
+                if (gf_uuid_is_null (loc->inode->gfid)) {
                         subvolume = FIRST_CHILD (this);
                         local->subvolume = subvolume;
                         wind = _gf_true;
@@ -484,8 +437,8 @@ svc_lookup (call_frame_t *frame, xlator_t *this, loc_t *loc,
 
 out:
         if (wind)
-                STACK_WIND (frame, svc_lookup_cbk,
-                            subvolume, subvolume->fops->lookup, loc, xdata);
+                STACK_WIND (frame, gf_svc_lookup_cbk, subvolume,
+                            subvolume->fops->lookup, loc, xdata);
         else
                 SVC_STACK_UNWIND (lookup, frame, op_ret, op_errno, NULL,
                                   NULL, NULL, NULL);
@@ -498,13 +451,95 @@ out:
         return 0;
 }
 
+static int32_t
+gf_svc_statfs (call_frame_t *frame, xlator_t *this, loc_t *loc, dict_t *xdata)
+{
+        xlator_t      *subvolume  = NULL;
+        int32_t        ret        = -1;
+        int            inode_type = -1;
+        int32_t        op_ret     = -1;
+        int32_t        op_errno   = EINVAL;
+        gf_boolean_t   wind       = _gf_false;
+        svc_private_t  *priv      = NULL;
+        const char     *path      = NULL;
+        int             path_len  = -1;
+        int             snap_len  = -1;
+        loc_t           root_loc  = {0,};
+        loc_t          *temp_loc  = NULL;
+
+        GF_VALIDATE_OR_GOTO ("svc", this, out);
+        GF_VALIDATE_OR_GOTO (this->name, frame, out);
+        GF_VALIDATE_OR_GOTO (this->name, loc, out);
+        GF_VALIDATE_OR_GOTO (this->name, loc->inode, out);
+
+        priv = this->private;
+        SVC_GET_SUBVOL_FROM_CTX (this, op_ret, op_errno, inode_type, ret,
+                                 loc->inode, subvolume, out);
+        path_len = strlen (loc->path);
+        snap_len = strlen (priv->path);
+        temp_loc = loc;
+
+        if (path_len >= snap_len && inode_type == VIRTUAL_INODE) {
+                path = &loc->path[path_len - snap_len];
+                if (!strcmp (path, priv->path)) {
+                        /*
+                         * statfs call for virtual snap directory.
+                         * Sent the fops to parent volume by removing
+                         * virtual directory from path
+                         */
+                        subvolume = FIRST_CHILD (this);
+                        root_loc.path = gf_strdup("/");
+                        gf_uuid_clear(root_loc.gfid);
+                        root_loc.gfid[15] = 1;
+                        root_loc.inode = inode_ref (loc->inode->table->root);
+                        temp_loc = &root_loc;
+                }
+        }
+
+        STACK_WIND_TAIL (frame, subvolume, subvolume->fops->statfs,
+                         temp_loc, xdata);
+        if (temp_loc == &root_loc)
+                loc_wipe (temp_loc);
+
+        wind = _gf_true;
+out:
+        if (!wind)
+                SVC_STACK_UNWIND (statfs, frame, op_ret, op_errno,
+                                  NULL, NULL);
+        return 0;
+}
+
+static int32_t
+gf_svc_stat_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
+                 int32_t op_ret, int32_t op_errno, struct iatt *buf,
+                 dict_t *xdata)
+{
+        /* Consider a testcase:
+         * #mount -t nfs host1:/vol1 /mnt
+         * #ls /mnt
+         * #ls /mnt/.snaps (As expected this fails)
+         * #gluster volume set vol1 features.uss enable
+         * Now `ls /mnt/.snaps` should work,
+         * but fails with No such file or directory.
+         * This is because NFS client caches the list of files in
+         * a directory. This cache is updated if there are any changes
+         * in the directory attributes. To solve this problem change
+         * a attribute 'ctime' when USS is enabled
+         */
+        if (op_ret == 0 && IA_ISDIR(buf->ia_type))
+                buf->ia_ctime_nsec++;
+
+        SVC_STACK_UNWIND (stat, frame, op_ret, op_errno, buf, xdata);
+        return 0;
+}
+
 /* should all the fops be handled like lookup is supposed to be
    handled? i.e just based on inode type decide where the call should
    be sent and in the call back update the contexts.
 */
-int32_t
-svc_stat (call_frame_t *frame, xlator_t *this, loc_t *loc,
-          dict_t *xdata)
+static int32_t
+gf_svc_stat (call_frame_t *frame, xlator_t *this, loc_t *loc,
+             dict_t *xdata)
 {
         int32_t      ret        = -1;
         int          inode_type = -1;
@@ -521,7 +556,8 @@ svc_stat (call_frame_t *frame, xlator_t *this, loc_t *loc,
         SVC_GET_SUBVOL_FROM_CTX (this, op_ret, op_errno, inode_type, ret,
                                  loc->inode, subvolume, out);
 
-        STACK_WIND_TAIL (frame,subvolume, subvolume->fops->stat, loc, xdata);
+        STACK_WIND (frame, gf_svc_stat_cbk, subvolume,
+                    subvolume->fops->stat, loc, xdata);
 
         wind = _gf_true;
 
@@ -532,8 +568,8 @@ out:
         return 0;
 }
 
-int32_t
-svc_fstat (call_frame_t *frame, xlator_t *this, fd_t *fd, dict_t *xdata)
+static int32_t
+gf_svc_fstat (call_frame_t *frame, xlator_t *this, fd_t *fd, dict_t *xdata)
 {
         int32_t      ret        = -1;
         int          inode_type = -1;
@@ -561,9 +597,9 @@ out:
         return ret;
 }
 
-int32_t
-svc_opendir_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
-                 int32_t op_ret, int32_t op_errno, fd_t *fd, dict_t *xdata)
+static int32_t
+gf_svc_opendir_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
+                    int32_t op_ret, int32_t op_errno, fd_t *fd, dict_t *xdata)
 {
         svc_fd_t        *svc_fd          = NULL;
         svc_local_t     *local           = NULL;
@@ -628,9 +664,9 @@ out:
    will not be any corresponding fd opened on svs and
    svc has to do things that open-behind is doing.
 */
-int32_t
-svc_opendir (call_frame_t *frame, xlator_t *this, loc_t *loc, fd_t *fd,
-             dict_t *xdata)
+static int32_t
+gf_svc_opendir (call_frame_t *frame, xlator_t *this, loc_t *loc, fd_t *fd,
+                dict_t *xdata)
 {
         int32_t        ret        = -1;
         int            inode_type = -1;
@@ -662,8 +698,8 @@ svc_opendir (call_frame_t *frame, xlator_t *this, loc_t *loc, fd_t *fd,
         local->subvolume = subvolume;
         frame->local = local;
 
-        STACK_WIND (frame, svc_opendir_cbk, subvolume, subvolume->fops->opendir,
-                    loc, fd, xdata);
+        STACK_WIND (frame, gf_svc_opendir_cbk, subvolume,
+                    subvolume->fops->opendir, loc, fd, xdata);
 
         wind = _gf_true;
 
@@ -674,9 +710,9 @@ out:
         return 0;
 }
 
-int32_t
-svc_setattr (call_frame_t *frame, xlator_t *this, loc_t *loc,
-             struct iatt *stbuf, int32_t valid, dict_t *xdata)
+static int32_t
+gf_svc_setattr (call_frame_t *frame, xlator_t *this, loc_t *loc,
+                struct iatt *stbuf, int32_t valid, dict_t *xdata)
 {
         int32_t      ret        = -1;
         int          inode_type = -1;
@@ -718,9 +754,11 @@ out:
         return 0;
 }
 
-int32_t
-svc_fsetattr (call_frame_t *frame, xlator_t *this, fd_t *fd, struct iatt *stbuf,
-             int32_t valid, dict_t *xdata)
+/* XXX: This function is currently not used. Remove "#if 0" when required */
+#if 0
+static int32_t
+gf_svc_fsetattr (call_frame_t *frame, xlator_t *this, fd_t *fd,
+                 struct iatt *stbuf, int32_t valid, dict_t *xdata)
 {
         int32_t      ret        = -1;
         int          inode_type = -1;
@@ -760,10 +798,11 @@ out:
                                   NULL, NULL, NULL);
         return 0;
 }
+#endif /* gf_svc_fsetattr() is not used */
 
-int32_t
-svc_getxattr (call_frame_t *frame, xlator_t *this, loc_t *loc, const char *name,
-              dict_t *xdata)
+static int32_t
+gf_svc_getxattr (call_frame_t *frame, xlator_t *this, loc_t *loc,
+                 const char *name, dict_t *xdata)
 {
         int32_t          ret                    = -1;
         int              inode_type             = -1;
@@ -791,6 +830,9 @@ svc_getxattr (call_frame_t *frame, xlator_t *this, loc_t *loc, const char *name,
          * If the name variable matches this key then we have
          * to send back .snaps as the real filename.
          */
+        if (!name)
+                goto stack_wind;
+
         sscanf (name, "%[^:]:%[^@]", attrname, attrval);
         strcat (attrname, ":");
 
@@ -818,7 +860,7 @@ svc_getxattr (call_frame_t *frame, xlator_t *this, loc_t *loc, const char *name,
                         goto out;
                 }
         }
-
+stack_wind:
         SVC_GET_SUBVOL_FROM_CTX (this, op_ret, op_errno, inode_type, ret,
                                  loc->inode, subvolume, out);
 
@@ -838,9 +880,11 @@ out:
         return 0;
 }
 
-int32_t
-svc_fgetxattr (call_frame_t *frame, xlator_t *this, fd_t *fd, const char *name,
-              dict_t *xdata)
+/* XXX: This function is currently not used. Mark it '#if 0' when required */
+#if 0
+static int32_t
+gf_svc_fgetxattr (call_frame_t *frame, xlator_t *this, fd_t *fd,
+                  const char *name, dict_t *xdata)
 {
         int32_t       ret        = -1;
         int           inode_type = -1;
@@ -868,10 +912,11 @@ out:
                                   NULL, NULL);
         return 0;
 }
+#endif /* gf_svc_fgetxattr() is not used */
 
-int32_t
-svc_setxattr (call_frame_t *frame, xlator_t *this, loc_t *loc, dict_t *dict,
-              int32_t flags, dict_t *xdata)
+static int32_t
+gf_svc_setxattr (call_frame_t *frame, xlator_t *this, loc_t *loc, dict_t *dict,
+                 int32_t flags, dict_t *xdata)
 {
         int32_t      ret         = -1;
         int          inode_type  = -1;
@@ -914,9 +959,9 @@ out:
         return 0;
 }
 
-int32_t
-svc_fsetxattr (call_frame_t *frame, xlator_t *this, fd_t *fd, dict_t *dict,
-              int32_t flags, dict_t *xdata)
+static int32_t
+gf_svc_fsetxattr (call_frame_t *frame, xlator_t *this, fd_t *fd, dict_t *dict,
+                  int32_t flags, dict_t *xdata)
 {
         int32_t      ret        = -1;
         int          inode_type = -1;
@@ -958,9 +1003,9 @@ out:
         return 0;
 }
 
-int32_t
-svc_rmdir (call_frame_t *frame, xlator_t *this, loc_t *loc, int flags,
-           dict_t *xdata)
+static int32_t
+gf_svc_rmdir (call_frame_t *frame, xlator_t *this, loc_t *loc, int flags,
+              dict_t *xdata)
 {
         int          inode_type = -1;
         int          ret        = -1;
@@ -1002,11 +1047,11 @@ out:
         return 0;
 }
 
-int32_t
-svc_mkdir_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
-               int32_t op_ret, int32_t op_errno, inode_t *inode,
-               struct iatt *buf, struct iatt *preparent,
-               struct iatt *postparent, dict_t *xdata)
+static int32_t
+gf_svc_mkdir_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
+                  int32_t op_ret, int32_t op_errno, inode_t *inode,
+                  struct iatt *buf, struct iatt *preparent,
+                  struct iatt *postparent, dict_t *xdata)
 {
         int inode_type = -1;
         int ret        = -1;
@@ -1027,9 +1072,9 @@ out:
         return 0;
 }
 
-int32_t
-svc_mkdir (call_frame_t *frame, xlator_t *this, loc_t *loc, mode_t mode,
-           mode_t umask, dict_t *xdata)
+static int32_t
+gf_svc_mkdir (call_frame_t *frame, xlator_t *this, loc_t *loc, mode_t mode,
+              mode_t umask, dict_t *xdata)
 {
         int            parent_type = -1;
         int            ret         = -1;
@@ -1056,7 +1101,7 @@ svc_mkdir (call_frame_t *frame, xlator_t *this, loc_t *loc, mode_t mode,
         }
 
         if (strcmp (loc->name, priv->path) && parent_type == NORMAL_INODE) {
-                STACK_WIND (frame, svc_mkdir_cbk, FIRST_CHILD (this),
+                STACK_WIND (frame, gf_svc_mkdir_cbk, FIRST_CHILD (this),
                             FIRST_CHILD (this)->fops->mkdir, loc, mode,
                             umask, xdata);
         } else {
@@ -1074,11 +1119,11 @@ out:
         return 0;
 }
 
-int32_t
-svc_mknod_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
-               int32_t op_ret, int32_t op_errno, inode_t *inode,
-               struct iatt *buf, struct iatt *preparent,
-               struct iatt *postparent, dict_t *xdata)
+static int32_t
+gf_svc_mknod_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
+                  int32_t op_ret, int32_t op_errno, inode_t *inode,
+                  struct iatt *buf, struct iatt *preparent,
+                  struct iatt *postparent, dict_t *xdata)
 {
         int inode_type = -1;
         int ret        = -1;
@@ -1098,9 +1143,9 @@ out:
         return 0;
 }
 
-int32_t
-svc_mknod (call_frame_t *frame, xlator_t *this, loc_t *loc, mode_t mode,
-           dev_t rdev, mode_t umask, dict_t *xdata)
+static int32_t
+gf_svc_mknod (call_frame_t *frame, xlator_t *this, loc_t *loc, mode_t mode,
+              dev_t rdev, mode_t umask, dict_t *xdata)
 {
         int            parent_type = -1;
         int            ret         = -1;
@@ -1127,7 +1172,7 @@ svc_mknod (call_frame_t *frame, xlator_t *this, loc_t *loc, mode_t mode,
         }
 
         if (strcmp (loc->name, priv->path) && parent_type == NORMAL_INODE) {
-                STACK_WIND (frame, svc_mknod_cbk, FIRST_CHILD (this),
+                STACK_WIND (frame, gf_svc_mknod_cbk, FIRST_CHILD (this),
                             FIRST_CHILD (this)->fops->mknod, loc, mode,
                             rdev, umask, xdata);
         } else {
@@ -1149,9 +1194,9 @@ out:
    a virtual inode, then unwind the call back with EROFS. Otherwise simply
    STACK_WIND the call to the first child of svc xlator.
 */
-int32_t
-svc_open (call_frame_t *frame, xlator_t *this, loc_t *loc, int32_t flags,
-          fd_t *fd, dict_t *xdata)
+static int32_t
+gf_svc_open (call_frame_t *frame, xlator_t *this, loc_t *loc, int32_t flags,
+             fd_t *fd, dict_t *xdata)
 {
         xlator_t    *subvolume  = NULL;
         int          inode_type = -1;
@@ -1194,11 +1239,11 @@ out:
         return 0;
 }
 
-int32_t
-svc_create_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
-                int32_t op_ret, int32_t op_errno, fd_t *fd, inode_t *inode,
-                struct iatt *stbuf, struct iatt *preparent,
-                struct iatt *postparent, dict_t *xdata)
+static int32_t
+gf_svc_create_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
+                   int32_t op_ret, int32_t op_errno, fd_t *fd, inode_t *inode,
+                   struct iatt *stbuf, struct iatt *preparent,
+                   struct iatt *postparent, dict_t *xdata)
 {
         int  inode_type = -1;
         int  ret        = -1;
@@ -1219,10 +1264,9 @@ out:
         return 0;
 }
 
-int32_t
-svc_create (call_frame_t *frame, xlator_t *this,
-            loc_t *loc, int32_t flags, mode_t mode,
-            mode_t umask, fd_t *fd, dict_t *xdata)
+static int32_t
+gf_svc_create (call_frame_t *frame, xlator_t *this, loc_t *loc, int32_t flags,
+               mode_t mode, mode_t umask, fd_t *fd, dict_t *xdata)
 {
         int            parent_type = -1;
         int            ret         = -1;
@@ -1250,7 +1294,7 @@ svc_create (call_frame_t *frame, xlator_t *this,
         }
 
         if (strcmp (loc->name, priv->path) && parent_type == NORMAL_INODE) {
-                STACK_WIND (frame, svc_create_cbk, FIRST_CHILD (this),
+                STACK_WIND (frame, gf_svc_create_cbk, FIRST_CHILD (this),
                             FIRST_CHILD (this)->fops->create, loc, flags,
                             mode, umask, fd, xdata);
         } else {
@@ -1268,11 +1312,11 @@ out:
         return 0;
 }
 
-int32_t
-svc_symlink_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
-                     int32_t op_ret, int32_t op_errno, inode_t *inode,
-                     struct iatt *buf, struct iatt *preparent,
-                     struct iatt *postparent, dict_t *xdata)
+static int32_t
+gf_svc_symlink_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
+                    int32_t op_ret, int32_t op_errno, inode_t *inode,
+                    struct iatt *buf, struct iatt *preparent,
+                    struct iatt *postparent, dict_t *xdata)
 {
         int inode_type = -1;
         int ret        = -1;
@@ -1293,9 +1337,9 @@ out:
         return 0;
 }
 
-int32_t
-svc_symlink (call_frame_t *frame, xlator_t *this, const char *linkpath,
-             loc_t *loc, mode_t umask, dict_t *xdata)
+static int32_t
+gf_svc_symlink (call_frame_t *frame, xlator_t *this, const char *linkpath,
+                loc_t *loc, mode_t umask, dict_t *xdata)
 {
         int            parent_type = -1;
         int            op_ret      = -1;
@@ -1322,7 +1366,7 @@ svc_symlink (call_frame_t *frame, xlator_t *this, const char *linkpath,
         }
 
         if (strcmp (loc->name, priv->path) && parent_type == NORMAL_INODE) {
-                STACK_WIND (frame, svc_symlink_cbk, FIRST_CHILD (this),
+                STACK_WIND (frame, gf_svc_symlink_cbk, FIRST_CHILD (this),
                             FIRST_CHILD (this)->fops->symlink, linkpath, loc,
                             umask, xdata);
         } else {
@@ -1340,9 +1384,9 @@ out:
         return 0;
 }
 
-int32_t
-svc_unlink (call_frame_t *frame, xlator_t *this, loc_t *loc, int flags,
-            dict_t *xdata)
+static int32_t
+gf_svc_unlink (call_frame_t *frame, xlator_t *this, loc_t *loc, int flags,
+               dict_t *xdata)
 {
         int            inode_type   = -1;
         int            op_ret       = -1;
@@ -1383,9 +1427,9 @@ out:
         return 0;
 }
 
-int32_t
-svc_readv (call_frame_t *frame, xlator_t *this, fd_t *fd, size_t size,
-           off_t offset, uint32_t flags, dict_t *xdata)
+static int32_t
+gf_svc_readv (call_frame_t *frame, xlator_t *this, fd_t *fd, size_t size,
+              off_t offset, uint32_t flags, dict_t *xdata)
 {
         int           inode_type = -1;
         xlator_t     *subvolume  = NULL;
@@ -1414,9 +1458,9 @@ out:
         return 0;
 }
 
-int32_t
-svc_readlink (call_frame_t *frame, xlator_t *this,
-              loc_t *loc, size_t size, dict_t *xdata)
+static int32_t
+gf_svc_readlink (call_frame_t *frame, xlator_t *this, loc_t *loc, size_t size,
+                 dict_t *xdata)
 {
         int              inode_type = -1;
         xlator_t        *subvolume  = NULL;
@@ -1445,9 +1489,9 @@ out:
         return 0;
 }
 
-int32_t
-svc_access (call_frame_t *frame, xlator_t *this, loc_t *loc, int32_t mask,
-            dict_t *xdata)
+static int32_t
+gf_svc_access (call_frame_t *frame, xlator_t *this, loc_t *loc, int32_t mask,
+               dict_t *xdata)
 {
         int            ret        = -1;
         int            inode_type = -1;
@@ -1477,12 +1521,48 @@ out:
 }
 
 int32_t
-svc_readdir (call_frame_t *frame, xlator_t *this, fd_t *fd,
-             size_t size, off_t off,
-             dict_t *xdata)
+gf_svc_readdir_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
+                    int32_t op_ret, int32_t op_errno, gf_dirent_t *entries,
+                    dict_t *xdata)
+{
+        gf_dirent_t   *entry      = NULL;
+        gf_dirent_t   *tmpentry  = NULL;
+        svc_local_t   *local      = NULL;
+        svc_private_t *priv       = NULL;
+
+        if (op_ret < 0)
+                goto out;
+
+        GF_VALIDATE_OR_GOTO (this->name, this->private, out);
+
+        priv = this->private;
+        local = frame->local;
+
+        /* If .snaps pre-exists, then it should not be listed
+         * in the NORMAL INODE directory when USS is enabled,
+         * so filter the .snaps entry if exists.
+         * However it is OK to list .snaps in VIRTUAL world
+         */
+        if (local->subvolume != FIRST_CHILD (this))
+                goto out;
+
+        list_for_each_entry_safe (entry, tmpentry, &entries->list, list) {
+                if (strcmp(priv->path, entry->d_name) == 0)
+                        gf_dirent_entry_free (entry);
+        }
+
+out:
+        SVC_STACK_UNWIND (readdir, frame, op_ret, op_errno, entries, xdata);
+        return 0;
+}
+
+static int32_t
+gf_svc_readdir (call_frame_t *frame, xlator_t *this, fd_t *fd, size_t size,
+                off_t off, dict_t *xdata)
 {
         int           inode_type = -1;
         xlator_t     *subvolume  = NULL;
+        svc_local_t  *local      = NULL;
         int           ret        = -1;
         int           op_ret     = -1;
         int           op_errno   = EINVAL;
@@ -1513,8 +1593,16 @@ svc_readdir (call_frame_t *frame, xlator_t *this, fd_t *fd,
         SVC_GET_SUBVOL_FROM_CTX (this, op_ret, op_errno, inode_type, ret,
                                  fd->inode, subvolume, out);
 
-        STACK_WIND_TAIL (frame, subvolume, subvolume->fops->readdir, fd, size,
-                         off, xdata);
+        local = mem_get0 (this->local_pool);
+        if (!local) {
+                gf_log (this->name, GF_LOG_ERROR, "failed to allocate local");
+                goto out;
+        }
+        local->subvolume = subvolume;
+        frame->local = local;
+
+	STACK_WIND (frame, gf_svc_readdir_cbk, subvolume,
+                    subvolume->fops->readdir, fd, size, off, xdata);
 
         wind = _gf_true;
 
@@ -1552,11 +1640,11 @@ out:
  * windows.
  */
 
-int32_t
-svc_readdirp_lookup_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
-                         int32_t op_ret, int32_t op_errno, inode_t *inode,
-                         struct iatt *buf, dict_t *xdata,
-                         struct iatt *postparent)
+static int32_t
+gf_svc_readdirp_lookup_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
+                            int32_t op_ret, int32_t op_errno, inode_t *inode,
+                            struct iatt *buf, dict_t *xdata,
+                            struct iatt *postparent)
 {
         gf_dirent_t    entries;
         gf_dirent_t   *entry      = NULL;
@@ -1573,6 +1661,9 @@ svc_readdirp_lookup_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         INIT_LIST_HEAD (&entries.list);
 
         local = frame->local;
+
+        if (local->xdata != NULL)
+                dict_unref (xdata);
 
         if (op_ret) {
                 op_ret = 0;
@@ -1624,10 +1715,11 @@ out:
         return 0;
 }
 
-gf_boolean_t
-svc_readdir_on_special_dir (call_frame_t *frame, void *cookie, xlator_t *this,
-                            int32_t op_ret, int32_t op_errno,
-                            gf_dirent_t *entries, dict_t *xdata)
+static gf_boolean_t
+gf_svc_readdir_on_special_dir (call_frame_t *frame, void *cookie,
+                               xlator_t *this, int32_t op_ret,
+                               int32_t op_errno, gf_dirent_t *entries,
+                               dict_t *xdata)
 {
         svc_local_t   *local      = NULL;
         svc_private_t *private    = NULL;
@@ -1679,9 +1771,9 @@ svc_readdir_on_special_dir (call_frame_t *frame, void *cookie, xlator_t *this,
                         }
                 }
 
-                uuid_copy (local->loc.pargfid, fd->inode->gfid);
-                uuid_copy (local->loc.gfid, inode->gfid);
-                if (uuid_is_null (inode->gfid))
+                gf_uuid_copy (local->loc.pargfid, fd->inode->gfid);
+                gf_uuid_copy (local->loc.gfid, inode->gfid);
+                if (gf_uuid_is_null (inode->gfid))
                         ret = inode_path (fd->inode, private->path, &path);
                 else
                         ret = inode_path (inode, NULL, &path);
@@ -1710,8 +1802,11 @@ svc_readdir_on_special_dir (call_frame_t *frame, void *cookie, xlator_t *this,
                 }
 
                 local->cookie = cookie;
-                local->xdata = dict_ref (xdata);
-                STACK_WIND (frame, svc_readdirp_lookup_cbk,
+                if (xdata == NULL)
+                        local->xdata = NULL;
+                else
+                        local->xdata = dict_ref (xdata);
+                STACK_WIND (frame, gf_svc_readdirp_lookup_cbk,
                             SECOND_CHILD (this),
                             SECOND_CHILD (this)->fops->lookup, loc, tmp_xdata);
                 unwind = _gf_false;
@@ -1725,24 +1820,26 @@ out:
         return unwind;
 }
 
-int32_t
-svc_readdirp_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
-                  int32_t op_ret, int32_t op_errno,
-                  gf_dirent_t *entries, dict_t *xdata)
+static int32_t
+gf_svc_readdirp_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
+                     int32_t op_ret, int32_t op_errno,
+                     gf_dirent_t *entries, dict_t *xdata)
 {
         gf_dirent_t   *entry      = NULL;
+        gf_dirent_t   *tmpentry   = NULL;
         svc_local_t   *local      = NULL;
-        gf_boolean_t   real       = _gf_true;
         int            inode_type = -1;
         int            ret        = -1;
         svc_fd_t      *svc_fd     = NULL;
         gf_boolean_t   unwind     = _gf_true;
-
-        GF_VALIDATE_OR_GOTO ("snapview-client", this, out);
+        svc_private_t *priv       = NULL;
 
         if (op_ret < 0)
                 goto out;
 
+        GF_VALIDATE_OR_GOTO ("snapview-client", this, out);
+        GF_VALIDATE_OR_GOTO (this->name, this->private, out);
+        priv = this->private;
         local = frame->local;
 
         svc_fd = svc_fd_ctx_get (this, local->fd);
@@ -1753,28 +1850,35 @@ svc_readdirp_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
         }
 
         if (local->subvolume == FIRST_CHILD (this))
-                real = _gf_true;
+                inode_type = NORMAL_INODE;
         else
-                real = _gf_false;
+                inode_type = VIRTUAL_INODE;
 
-        list_for_each_entry (entry, &entries->list, list) {
+        list_for_each_entry_safe (entry, tmpentry, &entries->list, list) {
+                /* If .snaps pre-exists, then it should not be listed
+                 * in the NORMAL INODE directory when USS is enabled,
+                 * so filter the .snaps entry if exists.
+                 * However it is OK to list .snaps in VIRTUAL world
+                 */
+                if (inode_type == NORMAL_INODE &&
+                    !strcmp(priv->path, entry->d_name)) {
+                        gf_dirent_entry_free (entry);
+                        continue;
+                }
+
                 if (!entry->inode)
                         continue;
-
-                if (real)
-                        inode_type = NORMAL_INODE;
-                else
-                        inode_type = VIRTUAL_INODE;
 
                 ret = svc_inode_ctx_set (this, entry->inode, inode_type);
                 if (ret)
                         gf_log (this->name, GF_LOG_ERROR, "failed to set inode "
                                 "context");
-                svc_fd->last_offset = entry->d_off;
+                if (svc_fd)
+                        svc_fd->last_offset = entry->d_off;
         }
 
-        unwind = svc_readdir_on_special_dir (frame, cookie, this, op_ret,
-                                             op_errno, entries, xdata);
+        unwind = gf_svc_readdir_on_special_dir (frame, cookie, this, op_ret,
+                                                op_errno, entries, xdata);
 
 out:
         if (unwind)
@@ -1784,10 +1888,9 @@ out:
         return 0;
 }
 
-int32_t
-svc_readdirp (call_frame_t *frame, xlator_t *this, fd_t *fd,
-              size_t size, off_t off,
-              dict_t *xdata)
+static int32_t
+gf_svc_readdirp (call_frame_t *frame, xlator_t *this, fd_t *fd, size_t size,
+                 off_t off, dict_t *xdata)
 {
         int            inode_type = -1;
         xlator_t      *subvolume  = NULL;
@@ -1842,7 +1945,7 @@ svc_readdirp (call_frame_t *frame, xlator_t *this, fd_t *fd,
         local->fd = fd_ref (fd);
         frame->local = local;
 
-        STACK_WIND (frame, svc_readdirp_cbk, subvolume,
+        STACK_WIND (frame, gf_svc_readdirp_cbk, subvolume,
                     subvolume->fops->readdirp, fd, size, off, xdata);
 
         wind = _gf_true;
@@ -1860,9 +1963,9 @@ out:
 /* Renaming the entries from or to snapshots is not allowed as the snapshots
    are read-only.
 */
-int32_t
-svc_rename (call_frame_t *frame, xlator_t *this, loc_t *oldloc,
-            loc_t *newloc, dict_t *xdata)
+static int32_t
+gf_svc_rename (call_frame_t *frame, xlator_t *this, loc_t *oldloc,
+               loc_t *newloc, dict_t *xdata)
 {
         int          src_inode_type  = -1;
         int          dst_inode_type  = -1;
@@ -1938,9 +2041,9 @@ out:
    will be equivalent of creating hardlinks across different filesystems.
    And so is vise versa.
 */
-int32_t
-svc_link (call_frame_t *frame, xlator_t *this, loc_t *oldloc, loc_t *newloc,
-          dict_t *xdata)
+static int32_t
+gf_svc_link (call_frame_t *frame, xlator_t *this, loc_t *oldloc, loc_t *newloc,
+             dict_t *xdata)
 {
         int          src_inode_type  = -1;
         int          dst_parent_type = -1;
@@ -1986,9 +2089,9 @@ out:
         return 0;
 }
 
-int32_t
-svc_removexattr (call_frame_t *frame, xlator_t *this, loc_t *loc,
-                 const char *name, dict_t *xdata)
+static int32_t
+gf_svc_removexattr (call_frame_t *frame, xlator_t *this, loc_t *loc,
+                    const char *name, dict_t *xdata)
 {
         int          ret        = -1;
         int          inode_type = -1;
@@ -2031,9 +2134,9 @@ out:
         return 0;
 }
 
-int
-svc_fsync (call_frame_t *frame, xlator_t *this, fd_t *fd, int datasync,
-           dict_t *xdata)
+static int
+gf_svc_fsync (call_frame_t *frame, xlator_t *this, fd_t *fd, int datasync,
+              dict_t *xdata)
 {
         int             inode_type = -1;
         int             ret        = -1;
@@ -2075,9 +2178,8 @@ out:
         return 0;
 }
 
-int32_t
-svc_flush (call_frame_t *frame, xlator_t *this,
-           fd_t *fd, dict_t *xdata)
+static int32_t
+gf_svc_flush (call_frame_t *frame, xlator_t *this, fd_t *fd, dict_t *xdata)
 {
         int32_t           op_ret     = -1;
         int32_t           op_errno   = 0;
@@ -2105,8 +2207,8 @@ out:
         return 0;
 }
 
-int32_t
-svc_releasedir (xlator_t *this, fd_t *fd)
+static int32_t
+gf_svc_releasedir (xlator_t *this, fd_t *fd)
 {
         svc_fd_t *sfd      = NULL;
         uint64_t          tmp_pfd  = 0;
@@ -2128,8 +2230,8 @@ out:
         return 0;
 }
 
-int32_t
-svc_forget (xlator_t *this, inode_t *inode)
+static int32_t
+gf_svc_forget (xlator_t *this, inode_t *inode)
 {
         int            ret      = -1;
         uint64_t       value    = 0;
@@ -2264,8 +2366,6 @@ fini (xlator_t *this)
 
         this->private = NULL;
 
-        GF_FREE (priv->path);
-        GF_FREE (priv->special_dir);
         GF_FREE (priv);
 
         return;
@@ -2297,36 +2397,37 @@ notify (xlator_t *this, int event, void *data, ...)
 }
 
 struct xlator_fops fops = {
-        .lookup        = svc_lookup,
-        .opendir       = svc_opendir,
-        .stat          = svc_stat,
-        .fstat         = svc_fstat,
-        .rmdir         = svc_rmdir,
-        .rename        = svc_rename,
-        .mkdir         = svc_mkdir,
-        .open          = svc_open,
-        .unlink        = svc_unlink,
-        .setattr       = svc_setattr,
-        .getxattr      = svc_getxattr,
-        .setxattr      = svc_setxattr,
-        .fsetxattr     = svc_fsetxattr,
-        .readv         = svc_readv,
-        .readdir       = svc_readdir,
-        .readdirp      = svc_readdirp,
-        .create        = svc_create,
-        .readlink      = svc_readlink,
-        .mknod         = svc_mknod,
-        .symlink       = svc_symlink,
-        .flush         = svc_flush,
-        .link          = svc_link,
-        .access        = svc_access,
-        .removexattr   = svc_removexattr,
-        .fsync         = svc_fsync,
+        .lookup        = gf_svc_lookup,
+        .opendir       = gf_svc_opendir,
+        .stat          = gf_svc_stat,
+        .fstat         = gf_svc_fstat,
+        .statfs        = gf_svc_statfs,
+        .rmdir         = gf_svc_rmdir,
+        .rename        = gf_svc_rename,
+        .mkdir         = gf_svc_mkdir,
+        .open          = gf_svc_open,
+        .unlink        = gf_svc_unlink,
+        .setattr       = gf_svc_setattr,
+        .getxattr      = gf_svc_getxattr,
+        .setxattr      = gf_svc_setxattr,
+        .fsetxattr     = gf_svc_fsetxattr,
+        .readv         = gf_svc_readv,
+        .readdir       = gf_svc_readdir,
+        .readdirp      = gf_svc_readdirp,
+        .create        = gf_svc_create,
+        .readlink      = gf_svc_readlink,
+        .mknod         = gf_svc_mknod,
+        .symlink       = gf_svc_symlink,
+        .flush         = gf_svc_flush,
+        .link          = gf_svc_link,
+        .access        = gf_svc_access,
+        .removexattr   = gf_svc_removexattr,
+        .fsync         = gf_svc_fsync,
 };
 
 struct xlator_cbks cbks = {
-        .forget = svc_forget,
-        .releasedir = svc_releasedir,
+        .forget = gf_svc_forget,
+        .releasedir = gf_svc_releasedir,
 };
 
 struct volume_options options[] = {

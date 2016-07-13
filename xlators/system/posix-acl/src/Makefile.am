@@ -1,6 +1,6 @@
 xlator_LTLIBRARIES = posix-acl.la
 xlatordir = $(libdir)/glusterfs/$(PACKAGE_VERSION)/xlator/system
-posix_acl_la_LDFLAGS = -module -avoid-version
+posix_acl_la_LDFLAGS = -module $(GF_XLATOR_DEFAULT_LDFLAGS)
 posix_acl_la_SOURCES = posix-acl.c posix-acl-xattr.c
 posix_acl_la_LIBADD = $(top_builddir)/libglusterfs/src/libglusterfs.la
 
@@ -21,3 +21,6 @@ access-control-compat:
 
 
 install-exec-local: access-control-compat
+
+uninstall-local:
+	rm -f $(DESTDIR)$(libdir)/glusterfs/$(PACKAGE_VERSION)/xlator/features/access-control.so

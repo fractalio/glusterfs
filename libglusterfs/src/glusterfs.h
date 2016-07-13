@@ -1,5 +1,5 @@
 /*
-  Copyright (c) 2008-2012 Red Hat, Inc. <http://www.redhat.com>
+  Copyright (c) 2008-2016 Red Hat, Inc. <http://www.redhat.com>
   This file is part of GlusterFS.
 
   This file is licensed to you under your choice of the GNU Lesser
@@ -10,11 +10,6 @@
 
 #ifndef _GLUSTERFS_H
 #define _GLUSTERFS_H
-
-#ifndef _CONFIG_H
-#define _CONFIG_H
-#include "config.h"
-#endif
 
 #include <stdio.h>
 #include <string.h>
@@ -34,9 +29,13 @@
 #include <pthread.h>
 #include <limits.h> /* For PATH_MAX */
 
+#include "glusterfs-fops.h" /* generated XDR values for FOPs */
+
 #include "list.h"
+#include "locking.h"
 #include "logging.h"
 #include "lkowner.h"
+#include "compat-uuid.h"
 
 #define GF_YES 1
 #define GF_NO  0
@@ -83,17 +82,22 @@
 #define GF_XATTR_CLRLK_CMD      "glusterfs.clrlk"
 #define GF_XATTR_PATHINFO_KEY   "trusted.glusterfs.pathinfo"
 #define GF_XATTR_NODE_UUID_KEY  "trusted.glusterfs.node-uuid"
+#define GF_REBAL_FIND_LOCAL_SUBVOL "glusterfs.find-local-subvol"
 #define GF_XATTR_VOL_ID_KEY   "trusted.glusterfs.volume-id"
 #define GF_XATTR_LOCKINFO_KEY   "trusted.glusterfs.lockinfo"
+#define GF_META_LOCK_KEY        "glusterfs.lock-migration-meta-lock"
+#define GF_META_UNLOCK_KEY      "glusterfs.lock-migration-meta-unlock"
 #define GF_XATTR_GET_REAL_FILENAME_KEY "glusterfs.get_real_filename:"
 #define GF_XATTR_USER_PATHINFO_KEY   "glusterfs.pathinfo"
-#define QUOTA_LIMIT_KEY "trusted.glusterfs.quota.limit-set"
-#define VIRTUAL_QUOTA_XATTR_CLEANUP_KEY "glusterfs.quota-xattr-cleanup"
 #define GF_INTERNAL_IGNORE_DEEM_STATFS "ignore-deem-statfs"
+#define GF_XATTR_IOSTATS_DUMP_KEY "trusted.io-stats-dump"
 
 #define GF_READDIR_SKIP_DIRS       "readdir-filter-directories"
+#define GF_MDC_LOADED_KEY_NAMES     "glusterfs.mdc.loaded.key.names"
 
 #define BD_XATTR_KEY             "user.glusterfs"
+#define GF_PREOP_PARENT_KEY      "glusterfs.preop.parent.key"
+#define GF_PREOP_CHECK_FAILED    "glusterfs.preop.check.failed"
 
 #define XATTR_IS_PATHINFO(x)  ((strncmp (x, GF_XATTR_PATHINFO_KEY,       \
                                         strlen (x)) == 0) ||             \
@@ -116,25 +120,78 @@
 #define GET_ANCESTRY_PATH_KEY "glusterfs.ancestry.path"
 #define GET_ANCESTRY_DENTRY_KEY "glusterfs.ancestry.dentry"
 
+#define BITROT_DEFAULT_CURRENT_VERSION  (unsigned long)1
+#define BITROT_DEFAULT_SIGNING_VERSION  (unsigned long)0
+
+/* on-disk object signature keys */
+#define BITROT_OBJECT_BAD_KEY       "trusted.bit-rot.bad-file"
+#define BITROT_CURRENT_VERSION_KEY  "trusted.bit-rot.version"
+#define BITROT_SIGNING_VERSION_KEY  "trusted.bit-rot.signature"
+
+/* globally usable bad file marker */
+#define GLUSTERFS_BAD_INODE         "glusterfs.bad-inode"
+
+/* on-disk size of signing xattr (not the signature itself) */
+#define BITROT_SIGNING_XATTR_SIZE_KEY  "trusted.glusterfs.bit-rot.size"
+
+/* GET/SET object signature */
+#define GLUSTERFS_GET_OBJECT_SIGNATURE "trusted.glusterfs.get-signature"
+#define GLUSTERFS_SET_OBJECT_SIGNATURE "trusted.glusterfs.set-signature"
+
+/* operation needs to be durable on-disk */
+#define GLUSTERFS_DURABLE_OP           "trusted.glusterfs.durable-op"
+
+/* key for version exchange b/w bitrot stub and changelog */
+#define GLUSTERFS_VERSION_XCHG_KEY     "glusterfs.version.xchg"
+
 #define GLUSTERFS_INTERNAL_FOP_KEY  "glusterfs-internal-fop"
+#define DHT_CHANGELOG_RENAME_OP_KEY   "changelog.rename-op"
 
 #define ZR_FILE_CONTENT_STR     "glusterfs.file."
 #define ZR_FILE_CONTENT_STRLEN 15
 
 #define GLUSTERFS_WRITE_IS_APPEND "glusterfs.write-is-append"
+#define GLUSTERFS_WRITE_UPDATE_ATOMIC "glusterfs.write-update-atomic"
 #define GLUSTERFS_OPEN_FD_COUNT "glusterfs.open-fd-count"
 #define GLUSTERFS_INODELK_COUNT "glusterfs.inodelk-count"
 #define GLUSTERFS_ENTRYLK_COUNT "glusterfs.entrylk-count"
 #define GLUSTERFS_POSIXLK_COUNT "glusterfs.posixlk-count"
 #define GLUSTERFS_PARENT_ENTRYLK "glusterfs.parent-entrylk"
 #define GLUSTERFS_INODELK_DOM_COUNT "glusterfs.inodelk-dom-count"
-#define QUOTA_SIZE_KEY "trusted.glusterfs.quota.size"
 #define GFID_TO_PATH_KEY "glusterfs.gfid2path"
 #define GF_XATTR_STIME_PATTERN "trusted.glusterfs.*.stime"
+#define GF_XATTR_XTIME_PATTERN "trusted.glusterfs.*.xtime"
+#define GF_XATTR_TRIGGER_SYNC "glusterfs.geo-rep.trigger-sync"
+
+/* quota xattrs */
+#define QUOTA_SIZE_KEY "trusted.glusterfs.quota.size"
+#define QUOTA_LIMIT_KEY "trusted.glusterfs.quota.limit-set"
+#define QUOTA_LIMIT_OBJECTS_KEY "trusted.glusterfs.quota.limit-objects"
+#define VIRTUAL_QUOTA_XATTR_CLEANUP_KEY "glusterfs.quota-xattr-cleanup"
+#define QUOTA_READ_ONLY_KEY "trusted.glusterfs.quota.read-only"
 
 /* Index xlator related */
 #define GF_XATTROP_INDEX_GFID "glusterfs.xattrop_index_gfid"
+#define GF_XATTROP_ENTRY_CHANGES_GFID "glusterfs.xattrop_entry_changes_gfid"
 #define GF_XATTROP_INDEX_COUNT "glusterfs.xattrop_index_count"
+#define GF_XATTROP_DIRTY_GFID "glusterfs.xattrop_dirty_gfid"
+#define GF_XATTROP_DIRTY_COUNT "glusterfs.xattrop_dirty_count"
+#define GF_XATTROP_ENTRY_IN_KEY "glusterfs.xattrop-entry-create"
+#define GF_XATTROP_ENTRY_OUT_KEY "glusterfs.xattrop-entry-delete"
+#define GF_INDEX_IA_TYPE_GET_REQ "glusterfs.index-ia-type-get-req"
+#define GF_INDEX_IA_TYPE_GET_RSP "glusterfs.index-ia-type-get-rsp"
+
+#define GF_HEAL_INFO "glusterfs.heal-info"
+#define GF_AFR_HEAL_SBRAIN "glusterfs.heal-sbrain"
+#define GF_AFR_SBRAIN_STATUS "replica.split-brain-status"
+#define GF_AFR_SBRAIN_CHOICE "replica.split-brain-choice"
+#define GF_AFR_SPB_CHOICE_TIMEOUT "replica.split-brain-choice-timeout"
+#define GF_AFR_SBRAIN_RESOLVE "replica.split-brain-heal-finalize"
+#define GF_AFR_ADD_BRICK "trusted.add-brick"
+#define GF_AFR_REPLACE_BRICK "trusted.replace-brick"
+#define GF_AFR_DIRTY "trusted.afr.dirty"
+#define GF_XATTROP_ENTRY_OUT "glusterfs.xattrop-entry-delete"
+#define GF_XATTROP_PURGE_INDEX "glusterfs.xattrop-purge-index"
 
 #define GF_GFIDLESS_LOOKUP "gfidless-lookup"
 /* replace-brick and pump related internal xattrs */
@@ -152,6 +209,8 @@
                                                        */
 
 #define GLUSTERFS_RPC_REPLY_SIZE               24
+
+#define STARTING_EVENT_THREADS                 1
 
 #define ZR_FILE_CONTENT_REQUEST(key) (!strncmp(key, ZR_FILE_CONTENT_STR, \
                                                ZR_FILE_CONTENT_STRLEN))
@@ -175,7 +234,6 @@
 
 #define GF_REBALANCE_TID_KEY     "rebalance-id"
 #define GF_REMOVE_BRICK_TID_KEY  "remove-brick-id"
-#define GF_REPLACE_BRICK_TID_KEY "replace-brick-id"
 
 #define UUID_CANONICAL_FORM_LEN  36
 
@@ -193,9 +251,20 @@
                                                        (iabuf)->ia_type) & ~S_IFMT)\
                                      == DHT_LINKFILE_MODE)
 #define DHT_LINKFILE_STR "linkto"
+#define DHT_COMMITHASH_STR "commithash"
 
-#define DHT_SKIP_NON_LINKTO_UNLINK "unlink-only-if-dht-linkto-file"
-#define DHT_SKIP_OPEN_FD_UNLINK "dont-unlink-for-open-fd"
+#define DHT_SKIP_NON_LINKTO_UNLINK  "unlink-only-if-dht-linkto-file"
+#define TIER_SKIP_NON_LINKTO_UNLINK  "unlink-only-if-tier-linkto-file"
+#define TIER_LINKFILE_GFID           "tier-linkfile-gfid"
+#define DHT_SKIP_OPEN_FD_UNLINK     "dont-unlink-for-open-fd"
+#define DHT_IATT_IN_XDATA_KEY       "dht-get-iatt-in-xattr"
+#define GET_LINK_COUNT              "get-link-count"
+
+/*CTR and Marker requires inode dentry link count from posix*/
+#define GF_RESPONSE_LINK_COUNT_XDATA "gf_response_link_count"
+#define GF_REQUEST_LINK_COUNT_XDATA  "gf_request_link_count"
+
+#define CTR_ATTACH_TIER_LOOKUP    "ctr_attach_tier_lookup"
 
 #define GF_LOG_LRU_BUFSIZE_DEFAULT 5
 #define GF_LOG_LRU_BUFSIZE_MIN 0
@@ -212,126 +281,11 @@
 #define GF_BACKTRACE_LEN        4096
 #define GF_BACKTRACE_FRAME_COUNT 7
 
+#define GF_LK_ADVISORY 0
+#define GF_LK_MANDATORY 1
 
-/* NOTE: add members ONLY at the end (just before _MAXVALUE) */
-typedef enum {
-        GF_FOP_NULL = 0,
-        GF_FOP_STAT,
-        GF_FOP_READLINK,
-        GF_FOP_MKNOD,
-        GF_FOP_MKDIR,
-        GF_FOP_UNLINK,
-        GF_FOP_RMDIR,
-        GF_FOP_SYMLINK,
-        GF_FOP_RENAME,
-        GF_FOP_LINK,
-        GF_FOP_TRUNCATE,
-        GF_FOP_OPEN,
-        GF_FOP_READ,
-        GF_FOP_WRITE,
-        GF_FOP_STATFS,
-        GF_FOP_FLUSH,
-        GF_FOP_FSYNC,      /* 15 */
-        GF_FOP_SETXATTR,
-        GF_FOP_GETXATTR,
-        GF_FOP_REMOVEXATTR,
-        GF_FOP_OPENDIR,
-        GF_FOP_FSYNCDIR,
-        GF_FOP_ACCESS,
-        GF_FOP_CREATE,
-        GF_FOP_FTRUNCATE,
-        GF_FOP_FSTAT,      /* 25 */
-        GF_FOP_LK,
-        GF_FOP_LOOKUP,
-        GF_FOP_READDIR,
-        GF_FOP_INODELK,
-        GF_FOP_FINODELK,
-        GF_FOP_ENTRYLK,
-        GF_FOP_FENTRYLK,
-        GF_FOP_XATTROP,
-        GF_FOP_FXATTROP,
-        GF_FOP_FGETXATTR,
-        GF_FOP_FSETXATTR,
-        GF_FOP_RCHECKSUM,
-        GF_FOP_SETATTR,
-        GF_FOP_FSETATTR,
-        GF_FOP_READDIRP,
-        GF_FOP_FORGET,
-        GF_FOP_RELEASE,
-        GF_FOP_RELEASEDIR,
-        GF_FOP_GETSPEC,
-        GF_FOP_FREMOVEXATTR,
-	GF_FOP_FALLOCATE,
-	GF_FOP_DISCARD,
-        GF_FOP_ZEROFILL,
-        GF_FOP_MAXVALUE,
-} glusterfs_fop_t;
-
-
-typedef enum {
-        GF_MGMT_NULL = 0,
-        GF_MGMT_MAXVALUE,
-} glusterfs_mgmt_t;
-
-typedef enum {
-        GF_OP_TYPE_NULL = 0,
-        GF_OP_TYPE_FOP,
-        GF_OP_TYPE_MGMT,
-        GF_OP_TYPE_MAX,
-} gf_op_type_t;
-
-/* NOTE: all the miscellaneous flags used by GlusterFS should be listed here */
-typedef enum {
-        GF_LK_GETLK = 0,
-        GF_LK_SETLK,
-        GF_LK_SETLKW,
-        GF_LK_RESLK_LCK,
-        GF_LK_RESLK_LCKW,
-        GF_LK_RESLK_UNLCK,
-        GF_LK_GETLK_FD,
-} glusterfs_lk_cmds_t;
-
-
-typedef enum {
-        GF_LK_F_RDLCK = 0,
-        GF_LK_F_WRLCK,
-        GF_LK_F_UNLCK,
-        GF_LK_EOL,
-} glusterfs_lk_types_t;
-
-typedef enum {
-        F_RESLK_LCK = 200,
-        F_RESLK_LCKW,
-        F_RESLK_UNLCK,
-        F_GETLK_FD,
-} glusterfs_lk_recovery_cmds_t;
-
-typedef enum {
-        GF_LOCK_POSIX,
-        GF_LOCK_INTERNAL
-} gf_lk_domain_t;
-
-
-typedef enum {
-        ENTRYLK_LOCK,
-        ENTRYLK_UNLOCK,
-        ENTRYLK_LOCK_NB
-} entrylk_cmd;
-
-
-typedef enum {
-        ENTRYLK_RDLCK,
-        ENTRYLK_WRLCK
-} entrylk_type;
-
-
-typedef enum {
-        GF_XATTROP_ADD_ARRAY,
-        GF_XATTROP_ADD_ARRAY64,
-        GF_XATTROP_OR_ARRAY,
-        GF_XATTROP_AND_ARRAY
-} gf_xattrop_flags_t;
-
+const char *fop_enum_to_pri_string (glusterfs_fop_t fop);
+const char *fop_enum_to_string (glusterfs_fop_t fop);
 
 #define GF_SET_IF_NOT_PRESENT 0x1 /* default behaviour */
 #define GF_SET_OVERWRITE      0x2 /* Overwrite with the buf given */
@@ -377,6 +331,8 @@ struct _cmd_args {
         uint32_t         log_buf_size;
         uint32_t         log_flush_timeout;
         int32_t          max_connect_attempts;
+        char            *print_exports;
+        char            *print_netgroups;
         /* advanced options */
         uint32_t         volfile_server_port;
         char            *volfile_server_transport;
@@ -389,6 +345,8 @@ struct _cmd_args {
         int              read_only;
         int              acl;
         int              selinux;
+        int              capability;
+        char            *oom_score_adj;
         int              enable_ino32;
         int              worm;
         int              mac_compat;
@@ -396,6 +354,10 @@ struct _cmd_args {
         int              gid_timeout;
         char             gid_timeout_set;
         int              aux_gfid_mount;
+
+        /* need a process wide timer-wheel? */
+        int              global_timer_wheel;
+
         struct list_head xlator_options;  /* list of xlator_option_t */
 
 	/* fuse options */
@@ -416,6 +378,8 @@ struct _cmd_args {
         int              background_qlen;
         int              congestion_threshold;
         char             *fuse_mountopts;
+        int              mem_acct;
+        int              resolve_gids;
 
         /* key args */
         char            *mount_point;
@@ -438,6 +402,7 @@ struct _glusterfs_graph {
         struct timeval            dob;
         void                     *first;
         void                     *top;   /* selected by -n */
+        uint32_t                  leaf_count;
         int                       xl_count;
         int                       id;    /* Used in logging */
         int                       used;  /* Should be set when fuse gets
@@ -456,6 +421,8 @@ typedef enum {
         MGMT_SSL_ALWAYS
 } mgmt_ssl_t;
 
+struct tvec_base;
+
 struct _glusterfs_ctx {
         cmd_args_t          cmd_args;
         char               *process_uuid;
@@ -467,7 +434,7 @@ struct _glusterfs_ctx {
         void               *event_pool;
         void               *iobuf_pool;
         void               *logbuf_pool;
-        pthread_mutex_t     lock;
+        gf_lock_t           lock;
         size_t              page_size;
         struct list_head    graphs; /* double linked list of graphs - one per volfile parse */
         glusterfs_graph_t  *active; /* the latest graph in use */
@@ -526,32 +493,16 @@ struct _glusterfs_ctx {
         /* Buffer to 'save' backtrace even under OOM-kill like situations*/
         char btbuf[GF_BACKTRACE_LEN];
 
+        pthread_mutex_t notify_lock;
+        pthread_cond_t notify_cond;
+        int notifying;
+
+        struct tvec_base *timer_wheel; /* global timer-wheel instance */
+
 };
 typedef struct _glusterfs_ctx glusterfs_ctx_t;
 
 glusterfs_ctx_t *glusterfs_ctx_new (void);
-
-typedef enum {
-        GF_EVENT_PARENT_UP = 1,
-        GF_EVENT_POLLIN,
-        GF_EVENT_POLLOUT,
-        GF_EVENT_POLLERR,
-        GF_EVENT_CHILD_UP,
-        GF_EVENT_CHILD_DOWN,
-        GF_EVENT_CHILD_CONNECTING,
-        GF_EVENT_CHILD_MODIFIED,
-        GF_EVENT_TRANSPORT_CLEANUP,
-        GF_EVENT_TRANSPORT_CONNECTED,
-        GF_EVENT_VOLFILE_MODIFIED,
-        GF_EVENT_GRAPH_NEW,
-        GF_EVENT_TRANSLATOR_INFO,
-        GF_EVENT_TRANSLATOR_OP,
-        GF_EVENT_AUTH_FAILED,
-        GF_EVENT_VOLUME_DEFRAG,
-        GF_EVENT_PARENT_DOWN,
-        GF_EVENT_VOLUME_BARRIER_OP,
-        GF_EVENT_MAXVAL,
-} glusterfs_event_t;
 
 struct gf_flock {
         short        l_type;
@@ -561,6 +512,13 @@ struct gf_flock {
         pid_t        l_pid;
         gf_lkowner_t l_owner;
 };
+
+typedef struct lock_migration_info {
+        struct list_head        list;
+        struct gf_flock         flock;
+        char                   *client_uid;
+        uint32_t                lk_flags;
+} lock_migration_info_t;
 
 #define GF_MUST_CHECK __attribute__((warn_unused_result))
 /*
@@ -591,11 +549,17 @@ struct gf_flock {
 #define SECURE_ACCESS_FILE     GLUSTERD_DEFAULT_WORKDIR "/secure-access"
 
 int glusterfs_graph_prepare (glusterfs_graph_t *graph, glusterfs_ctx_t *ctx);
+int glusterfs_graph_destroy_residual (glusterfs_graph_t *graph);
+int glusterfs_graph_deactivate (glusterfs_graph_t *graph);
 int glusterfs_graph_destroy (glusterfs_graph_t *graph);
+int glusterfs_get_leaf_count (glusterfs_graph_t *graph);
 int glusterfs_graph_activate (glusterfs_graph_t *graph, glusterfs_ctx_t *ctx);
 glusterfs_graph_t *glusterfs_graph_construct (FILE *fp);
-glusterfs_graph_t *glusterfs_graph_new ();
+glusterfs_graph_t *glusterfs_graph_new (void);
 int glusterfs_graph_reconfigure (glusterfs_graph_t *oldgraph,
                                   glusterfs_graph_t *newgraph);
+
+void
+gf_free_mig_locks (lock_migration_info_t *locks);
 
 #endif /* _GLUSTERFS_H */

@@ -85,6 +85,9 @@
 int
 afr_selfheal (xlator_t *this, uuid_t gfid);
 
+void
+afr_throttled_selfheal (call_frame_t *frame, xlator_t *this);
+
 int
 afr_selfheal_name (xlator_t *this, uuid_t gfid, const char *name,
                    void *gfid_req);
@@ -110,6 +113,11 @@ afr_selfheal_tryinodelk (call_frame_t *frame, xlator_t *this, inode_t *inode,
 			 unsigned char *locked_on);
 
 int
+afr_selfheal_tie_breaker_inodelk (call_frame_t *frame, xlator_t *this,
+                                  inode_t *inode, char *dom, off_t off,
+                                  size_t size, unsigned char *locked_on);
+
+int
 afr_selfheal_uninodelk (call_frame_t *frame, xlator_t *this, inode_t *inode,
 			char *dom, off_t off, size_t size,
 			const unsigned char *locked_on);
@@ -123,8 +131,14 @@ afr_selfheal_tryentrylk (call_frame_t *frame, xlator_t *this, inode_t *inode,
 			 char *dom, const char *name, unsigned char *locked_on);
 
 int
+afr_selfheal_tie_breaker_entrylk (call_frame_t *frame, xlator_t *this,
+                                  inode_t *inode, char *dom, const char *name,
+                                  unsigned char *locked_on);
+
+int
 afr_selfheal_unentrylk (call_frame_t *frame, xlator_t *this, inode_t *inode,
-			char *dom, const char *name, unsigned char *locked_on);
+			char *dom, const char *name, unsigned char *locked_on,
+                        dict_t *xdata);
 
 int
 afr_selfheal_unlocked_discover (call_frame_t *frame, inode_t *inode,
@@ -140,7 +154,11 @@ afr_selfheal_find_direction (call_frame_t *frame, xlator_t *this,
                              struct afr_reply *replies,
                              afr_transaction_type type,
                              unsigned char *locked_on, unsigned char *sources,
-                             unsigned char *sinks, uint64_t *witness);
+                             unsigned char *sinks, uint64_t *witness,
+                             gf_boolean_t *flag);
+int
+afr_selfheal_fill_matrix (xlator_t *this, int **matrix, int subvol, int idx,
+                          dict_t *xdata);
 
 int
 afr_selfheal_extract_xattr (xlator_t *this, struct afr_reply *replies,
@@ -160,7 +178,7 @@ afr_selfheal_recreate_entry (xlator_t *this, int dst, int source, inode_t *dir,
 
 int
 afr_selfheal_post_op (call_frame_t *frame, xlator_t *this, inode_t *inode,
-		      int subvol, dict_t *xattr);
+		      int subvol, dict_t *xattr, dict_t *xdata);
 
 call_frame_t *
 afr_frame_create (xlator_t *this);
@@ -182,22 +200,64 @@ afr_selfheal_newentry_mark (call_frame_t *frame, xlator_t *this, inode_t *inode,
                             int source, struct afr_reply *replies,
                             unsigned char *sources, unsigned char *newentry);
 
-inode_t*
-afr_inode_link (inode_t *inode, struct iatt *iatt);
-
 unsigned int
 afr_success_count (struct afr_reply *replies, unsigned int count);
 
 void
 afr_log_selfheal (uuid_t gfid, xlator_t *this, int ret, char *type,
-                  int source, unsigned char *healed_sinks);
+                  int source, unsigned char *sources,
+                  unsigned char *healed_sinks);
 
+void
+afr_mark_largest_file_as_source (xlator_t *this, unsigned char *sources,
+                                 struct afr_reply *replies);
 void
 afr_mark_active_sinks (xlator_t *this, unsigned char *sources,
                        unsigned char *locked_on, unsigned char *sinks);
 
 gf_boolean_t
+afr_dict_contains_heal_op (call_frame_t *frame);
+
+int
+afr_mark_split_brain_source_sinks (call_frame_t *frame, xlator_t *this,
+                                   inode_t *inode,
+                                   unsigned char *sources,
+                                   unsigned char *sinks,
+                                   unsigned char *healed_sinks,
+                                   unsigned char *locked_on,
+                                   struct afr_reply *replies,
+                                   afr_transaction_type type);
+
+int
+afr_get_child_index_from_name (xlator_t *this, char *name);
+
+gf_boolean_t
 afr_does_witness_exist (xlator_t *this, uint64_t *witness);
+
+int
+__afr_selfheal_data_prepare (call_frame_t *frame, xlator_t *this,
+                             inode_t *inode, unsigned char *locked_on,
+                             unsigned char *sources,
+                             unsigned char *sinks, unsigned char *healed_sinks,
+                             struct afr_reply *replies,
+                             gf_boolean_t *flag);
+
+int
+__afr_selfheal_metadata_prepare (call_frame_t *frame, xlator_t *this,
+                                 inode_t *inode, unsigned char *locked_on,
+                                 unsigned char *sources,
+                                 unsigned char *sinks,
+                                 unsigned char *healed_sinks,
+                                 struct afr_reply *replies,
+                                 gf_boolean_t *flag);
+int
+__afr_selfheal_entry_prepare (call_frame_t *frame, xlator_t *this,
+                              inode_t *inode, unsigned char *locked_on,
+                              unsigned char *sources,
+                              unsigned char *sinks,
+                              unsigned char *healed_sinks,
+                              struct afr_reply *replies, int *source_p,
+                              gf_boolean_t *flag);
 
 int
 afr_selfheal_unlocked_inspect (call_frame_t *frame, xlator_t *this,
@@ -205,4 +265,21 @@ afr_selfheal_unlocked_inspect (call_frame_t *frame, xlator_t *this,
                                gf_boolean_t *data_selfheal,
                                gf_boolean_t *metadata_selfheal,
                                gf_boolean_t *entry_selfheal);
+
+int
+afr_selfheal_do (call_frame_t *frame, xlator_t *this, uuid_t gfid);
+
+int
+afr_selfheal_lock_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
+		       int op_ret, int op_errno, dict_t *xdata);
+
+int
+afr_locked_fill (call_frame_t *frame, xlator_t *this,
+                 unsigned char *locked_on);
+int
+afr_choose_source_by_policy (afr_private_t *priv, unsigned char *sources,
+                             afr_transaction_type type);
+
+int
+afr_selfheal_metadata_by_stbuf (xlator_t *this, struct iatt *stbuf);
 #endif /* !_AFR_SELFHEAL_H */

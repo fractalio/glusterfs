@@ -43,7 +43,7 @@ except ImportError:
     # py 2.4
     from md5 import new as md5
 
-# auxillary gfid based access prefix
+# auxiliary gfid based access prefix
 _CL_AUX_GFID_PFX = ".gfid/"
 GF_OP_RETRIES = 20
 
@@ -203,13 +203,19 @@ def finalize(*a, **kw):
                 else:
                     raise
     if gconf.ssh_ctl_dir and not gconf.cpid:
-        shutil.rmtree(gconf.ssh_ctl_dir)
+        def handle_rm_error(func, path, exc_info):
+            if exc_info[1].errno == ENOENT:
+                return
+            raise exc_info[1]
+
+        shutil.rmtree(gconf.ssh_ctl_dir, onerror=handle_rm_error)
     if getattr(gconf, 'state_socket', None):
         try:
             os.unlink(gconf.state_socket)
         except:
             if sys.exc_info()[0] == OSError:
                 pass
+
     if gconf.log_exit:
         logging.info("exiting.")
     sys.stdout.flush()
@@ -247,16 +253,19 @@ def log_raise_exception(excont):
             if hasattr(gconf, 'transport'):
                 gconf.transport.wait()
                 if gconf.transport.returncode == 127:
-                    logging.warn("!!!!!!!!!!!!!")
-                    logging.warn('!!! getting "No such file or directory" '
-                                 "errors is most likely due to "
-                                 "MISCONFIGURATION"
-                                 ", please consult https://access.redhat.com"
-                                 "/site/documentation/en-US/Red_Hat_Storage"
-                                 "/2.1/html/Administration_Guide"
-                                 "/chap-User_Guide-Geo_Rep-Preparation-"
-                                 "Settingup_Environment.html")
-                    logging.warn("!!!!!!!!!!!!!")
+                    logging.error("getting \"No such file or directory\""
+                                  "errors is most likely due to "
+                                  "MISCONFIGURATION, please remove all "
+                                  "the public keys added by geo-replication "
+                                  "from authorized_keys file in slave nodes "
+                                  "and run Geo-replication create "
+                                  "command again.")
+                    logging.error("If `gsec_create container` was used, then "
+                                  "run `gluster volume geo-replication "
+                                  "<MASTERVOL> [<SLAVEUSER>@]<SLAVEHOST>::"
+                                  "<SLAVEVOL> config remote-gsyncd "
+                                  "<GSYNCD_PATH> (Example GSYNCD_PATH: "
+                                  "`/usr/libexec/glusterfs/gsyncd`)")
                 gconf.transport.terminate_geterr()
         elif isinstance(exc, OSError) and exc.errno in (ENOTCONN,
                                                         ECONNABORTED):
@@ -460,9 +469,8 @@ def selfkill(sig=SIGTERM):
     os.kill(os.getpid(), sig)
 
 
-def errno_wrap(call, arg=[], errnos=[], retry_errnos=[ESTALE]):
+def errno_wrap(call, arg=[], errnos=[], retry_errnos=[]):
     """ wrapper around calls resilient to errnos.
-    retry in case of ESTALE by default.
     """
     nr_tries = 0
     while True:
@@ -477,21 +485,14 @@ def errno_wrap(call, arg=[], errnos=[], retry_errnos=[ESTALE]):
             nr_tries += 1
             if nr_tries == GF_OP_RETRIES:
                 # probably a screwed state, cannot do much...
-                logging.warn('reached maximum retries (%s)...' % repr(arg))
-                return
+                logging.warn('reached maximum retries (%s)...%s' %
+                             (repr(arg), ex))
+                return ex.errno
             time.sleep(0.250)  # retry the call
 
 
 def lstat(e):
-    try:
-        return os.lstat(e)
-    except (IOError, OSError):
-        ex = sys.exc_info()[1]
-        if ex.errno == ENOENT:
-            return ex.errno
-        else:
-            raise
-
+    return errno_wrap(os.lstat, [e], [ENOENT], [ESTALE])
 
 class NoPurgeTimeAvailable(Exception):
     pass

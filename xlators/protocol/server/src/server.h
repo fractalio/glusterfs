@@ -23,6 +23,7 @@
 #include "timer.h"
 #include "client_t.h"
 #include "gidcache.h"
+#include "defaults.h"
 
 #define DEFAULT_BLOCK_SIZE         4194304   /* 4MB */
 #define DEFAULT_VOLUME_FILE_PATH   CONFDIR "/glusterfs.vol"
@@ -54,7 +55,7 @@ struct server_conf {
                                             heal is on else off. */
         char                   *conf_dir;
         struct _volfile_ctx    *volfile;
-        struct timespec         grace_ts;
+        uint32_t                grace_timeout;
         dict_t                 *auth_modules;
         pthread_mutex_t         mutex;
         struct list_head        xprt_list;
@@ -63,6 +64,19 @@ struct server_conf {
         gf_boolean_t            server_manage_gids; /* resolve gids on brick */
         gid_cache_t             gid_cache;
         int32_t                 gid_cache_timeout;
+
+        int                     event_threads; /* # of event threads
+                                                * configured */
+
+        gf_boolean_t            parent_up;
+        gf_boolean_t            dync_auth; /* if set authenticate dynamically,
+                                            * in case if volume set options
+                                            * (say *.allow | *.reject) are
+                                            * tweeked */
+        gf_boolean_t            child_up; /* Set to true, when child is up, and
+                                           * false, when child is down */
+
+        gf_lock_t               itable_lock;
 };
 typedef struct server_conf server_conf_t;
 
@@ -142,9 +156,22 @@ struct _server_state {
         struct gf_flock   flock;
         const char       *volume;
         dir_entry_t      *entry;
+        gf_seek_what_t    what;
 
         dict_t           *xdata;
         mode_t            umask;
+        struct gf_lease   lease;
+        lock_migration_info_t locklist;
+        /* required for compound fops */
+        gfs3_compound_req *req;
+        /* last length till which iovec for compound
+         * writes was processed */
+        int               write_length;
+        struct iovec      rsp_vector[MAX_IOVEC];
+        int               rsp_count;
+        struct iobuf     *rsp_iobuf;
+        struct iobref    *rsp_iobref;
+        compound_args_t  *args;
 };
 
 
@@ -167,4 +194,19 @@ server_submit_reply (call_frame_t *frame, rpcsvc_request_t *req, void *arg,
 int gf_server_check_setxattr_cmd (call_frame_t *frame, dict_t *dict);
 int gf_server_check_getxattr_cmd (call_frame_t *frame, const char *name);
 
+void
+forget_inode_if_no_dentry (inode_t *inode);
+
+int
+unserialize_req_locklist (gfs3_setactivelk_req *req,
+                          lock_migration_info_t *lmi);
+
+int
+serialize_rsp_dirent (gf_dirent_t *entries, gfs3_readdir_rsp *rsp);
+
+int
+serialize_rsp_direntp (gf_dirent_t *entries, gfs3_readdirp_rsp *rsp);
+
+server_ctx_t*
+server_ctx_get (client_t *client, xlator_t *xlator);
 #endif /* !_SERVER_H */

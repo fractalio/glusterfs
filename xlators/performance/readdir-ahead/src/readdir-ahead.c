@@ -23,18 +23,13 @@
  * preloads on the directory.
  */
 
-#ifndef _CONFIG_H
-#define _CONFIG_H
-#include "config.h"
-#endif
-
 #include "glusterfs.h"
 #include "xlator.h"
 #include "call-stub.h"
 #include "readdir-ahead.h"
 #include "readdir-ahead-mem-types.h"
 #include "defaults.h"
-
+#include "readdir-ahead-messages.h"
 static int rda_fill_fd(call_frame_t *, xlator_t *, fd_t *);
 
 /*
@@ -57,8 +52,9 @@ rda_fd_ctx *get_rda_fd_ctx(fd_t *fd, xlator_t *this)
 
 		LOCK_INIT(&ctx->lock);
 		INIT_LIST_HEAD(&ctx->entries.list);
-		ctx->state = RDA_FD_NEW;
+                ctx->state = RDA_FD_NEW;
 		/* ctx offset values initialized to 0 */
+                ctx->xattrs = NULL;
 
 		if (__fd_ctx_set(fd, this, (uint64_t) ctx) < 0) {
 			GF_FREE(ctx);
@@ -83,7 +79,12 @@ rda_reset_ctx(struct rda_fd_ctx *ctx)
 	ctx->cur_offset = 0;
 	ctx->cur_size = 0;
 	ctx->next_offset = 0;
+        ctx->op_errno = 0;
 	gf_dirent_free(&ctx->entries);
+        if (ctx->xattrs) {
+                dict_unref (ctx->xattrs);
+                ctx->xattrs = NULL;
+        }
 }
 
 /*
@@ -142,7 +143,7 @@ rda_readdirp_stub(call_frame_t *frame, xlator_t *this, fd_t *fd, size_t size,
 	gf_dirent_t entries;
 	int32_t ret;
 	struct rda_fd_ctx *ctx;
-	int op_errno = 0;
+        int op_errno = 0;
 
 	ctx = get_rda_fd_ctx(fd, this);
 	INIT_LIST_HEAD(&entries.list);
@@ -150,7 +151,6 @@ rda_readdirp_stub(call_frame_t *frame, xlator_t *this, fd_t *fd, size_t size,
 
 	if (!ret && (ctx->state & RDA_FD_ERROR)) {
 		ret = -1;
-		op_errno = ctx->op_errno;
 		ctx->state &= ~RDA_FD_ERROR;
 
 		/*
@@ -159,6 +159,12 @@ rda_readdirp_stub(call_frame_t *frame, xlator_t *this, fd_t *fd, size_t size,
 		 */
 		ctx->state |= RDA_FD_BYPASS;
 	}
+
+        /*
+         * Use the op_errno sent by lower layers as xlators above will check
+         * the op_errno for identifying whether readdir is completed or not.
+         */
+        op_errno = ctx->op_errno;
 
 	STACK_UNWIND_STRICT(readdirp, frame, ret, op_errno, &entries, xdata);
 	gf_dirent_free(&entries);
@@ -195,6 +201,15 @@ rda_readdirp(call_frame_t *frame, xlator_t *this, fd_t *fd, size_t size,
 	 */
 	if (!off && (ctx->state & RDA_FD_EOD) && (ctx->cur_size == 0)) {
 		rda_reset_ctx(ctx);
+                /*
+                 * Unref and discard the 'list of xattrs to be fetched'
+                 * stored during opendir call. This is done above - inside
+                 * rda_reset_ctx().
+                 * Now, ref the xdata passed by md-cache in actual readdirp()
+                 * call and use that for all subsequent internal readdirp()
+                 * requests issued by this xlator.
+                 */
+                ctx->xattrs = dict_ref (xdata);
 		fill = 1;
 	}
 
@@ -256,8 +271,9 @@ rda_fill_fd_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
 
 	/* Verify that the preload buffer is still pending on this data. */
 	if (ctx->next_offset != local->offset) {
-		gf_log(this->name, GF_LOG_ERROR,
-			"Out of sequence directory preload.");
+		gf_msg(this->name, GF_LOG_ERROR,
+                       0, READDIR_AHEAD_MSG_OUT_OF_SEQUENCE,
+                       "Out of sequence directory preload.");
 		ctx->state |= (RDA_FD_BYPASS|RDA_FD_ERROR);
 		ctx->op_errno = EUCLEAN;
 
@@ -282,6 +298,7 @@ rda_fill_fd_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
 		/* we've hit eod */
 		ctx->state &= ~RDA_FD_RUNNING;
 		ctx->state |= RDA_FD_EOD;
+                ctx->op_errno = op_errno;
 	} else if (op_ret == -1) {
 		/* kill the preload and pend the error */
 		ctx->state &= ~RDA_FD_RUNNING;
@@ -309,6 +326,14 @@ out:
 
 	if (!(ctx->state & RDA_FD_RUNNING)) {
 		fill = 0;
+        if (ctx->xattrs) {
+                /*
+                 * fill = 0 and hence rda_fill_fd() won't be invoked.
+                 * unref for ref taken in rda_fill_fd()
+                 */
+                dict_unref (ctx->xattrs);
+                ctx->xattrs = NULL;
+        }
 		STACK_DESTROY(ctx->fill_frame->root);
 		ctx->fill_frame = NULL;
 	}
@@ -329,6 +354,7 @@ rda_fill_fd(call_frame_t *frame, xlator_t *this, fd_t *fd)
 {
 	call_frame_t *nframe = NULL;
 	struct rda_local *local = NULL;
+        struct rda_local *orig_local = frame->local;
 	struct rda_fd_ctx *ctx;
 	off_t offset;
 	struct rda_priv *priv = this->private;
@@ -366,6 +392,11 @@ rda_fill_fd(call_frame_t *frame, xlator_t *this, fd_t *fd)
 		nframe->local = local;
 
 		ctx->fill_frame = nframe;
+
+        if (!ctx->xattrs && orig_local && orig_local->xattrs) {
+                /* when this function is invoked by rda_opendir_cbk */
+                ctx->xattrs = dict_ref(orig_local->xattrs);
+        }
 	} else {
 		nframe = ctx->fill_frame;
 		local = nframe->local;
@@ -375,9 +406,9 @@ rda_fill_fd(call_frame_t *frame, xlator_t *this, fd_t *fd)
 
 	UNLOCK(&ctx->lock);
 
-	STACK_WIND(nframe, rda_fill_fd_cbk, FIRST_CHILD(this),
-		   FIRST_CHILD(this)->fops->readdirp, fd, priv->rda_req_size,
-		   offset, NULL);
+        STACK_WIND(nframe, rda_fill_fd_cbk, FIRST_CHILD(this),
+                   FIRST_CHILD(this)->fops->readdirp, fd,
+                   priv->rda_req_size, offset, ctx->xattrs);
 
 	return 0;
 
@@ -388,14 +419,53 @@ err:
 	return -1;
 }
 
+
+static int
+rda_unpack_mdc_loaded_keys_to_dict(char *payload, dict_t *dict)
+{
+        int      ret = -1;
+        char    *mdc_key = NULL;
+
+        if (!payload || !dict) {
+                goto out;
+        }
+
+        mdc_key = strtok(payload, " ");
+        while (mdc_key != NULL) {
+                ret = dict_set_int8 (dict, mdc_key, 0);
+                if (ret) {
+                        goto out;
+                }
+                mdc_key = strtok(NULL, " ");
+        }
+
+out:
+        return ret;
+}
+
+
 static int32_t
 rda_opendir_cbk(call_frame_t *frame, void *cookie, xlator_t *this,
 		    int32_t op_ret, int32_t op_errno, fd_t *fd, dict_t *xdata)
 {
+        struct rda_local *local = frame->local;
+
 	if (!op_ret)
 		rda_fill_fd(frame, this, fd);
 
+        frame->local = NULL;
+
 	STACK_UNWIND_STRICT(opendir, frame, op_ret, op_errno, fd, xdata);
+
+        if (local && local->xattrs) {
+                /* unref for dict_new() done in rda_opendir */
+                dict_unref (local->xattrs);
+                local->xattrs = NULL;
+        }
+
+        if (local)
+                mem_put (local);
+
 	return 0;
 }
 
@@ -403,9 +473,57 @@ static int32_t
 rda_opendir(call_frame_t *frame, xlator_t *this, loc_t *loc, fd_t *fd,
 		dict_t *xdata)
 {
-	STACK_WIND(frame, rda_opendir_cbk, FIRST_CHILD(this),
-		   FIRST_CHILD(this)->fops->opendir, loc, fd, xdata);
-	return 0;
+        int                  ret = -1;
+        int                  op_errno = 0;
+        char                *payload = NULL;
+        struct rda_local    *local = NULL;
+        dict_t              *xdata_from_req = NULL;
+
+        if (xdata) {
+                /*
+                 * Retrieve list of keys set by md-cache xlator and store it
+                 * in local to be consumed in rda_opendir_cbk
+                 */
+                ret = dict_get_str (xdata, GF_MDC_LOADED_KEY_NAMES, &payload);
+                if (ret)
+                        goto wind;
+
+                xdata_from_req = dict_new();
+                if (!xdata_from_req) {
+                        op_errno = ENOMEM;
+                        goto unwind;
+                }
+
+                ret = rda_unpack_mdc_loaded_keys_to_dict((char *) payload,
+                                                         xdata_from_req);
+                if (ret) {
+                        dict_unref(xdata_from_req);
+                        goto wind;
+                }
+
+                local = mem_get0(this->local_pool);
+                if (!local) {
+                        dict_unref(xdata_from_req);
+                        op_errno = ENOMEM;
+                        goto unwind;
+                }
+
+                local->xattrs = xdata_from_req;
+                frame->local = local;
+        }
+
+wind:
+        if (xdata)
+                /* Remove the key after consumption. */
+                dict_del (xdata, GF_MDC_LOADED_KEY_NAMES);
+
+        STACK_WIND(frame, rda_opendir_cbk, FIRST_CHILD(this),
+                   FIRST_CHILD(this)->fops->opendir, loc, fd, xdata);
+        return 0;
+
+unwind:
+        STACK_UNWIND_STRICT(opendir, frame, -1, op_errno, fd, xdata);
+        return 0;
 }
 
 static int32_t
@@ -427,8 +545,9 @@ rda_releasedir(xlator_t *this, fd_t *fd)
 		STACK_DESTROY(ctx->fill_frame->root);
 
 	if (ctx->stub)
-		gf_log(this->name, GF_LOG_ERROR,
-			"released a directory with a pending stub");
+		gf_msg(this->name, GF_LOG_ERROR, 0,
+		        READDIR_AHEAD_MSG_DIR_RELEASE_PENDING_STUB,
+                       "released a directory with a pending stub");
 
 	GF_FREE(ctx);
 	return 0;
@@ -445,7 +564,8 @@ mem_acct_init(xlator_t *this)
 	ret = xlator_mem_acct_init(this, gf_rda_mt_end + 1);
 
 	if (ret != 0)
-		gf_log(this->name, GF_LOG_ERROR, "Memory accounting init"
+		gf_msg(this->name, GF_LOG_ERROR, ENOMEM,
+                       READDIR_AHEAD_MSG_NO_MEMORY, "Memory accounting init"
 		       "failed");
 
 out:
@@ -477,14 +597,16 @@ init(xlator_t *this)
         GF_VALIDATE_OR_GOTO("readdir-ahead", this, err);
 
         if (!this->children || this->children->next) {
-                gf_log(this->name,  GF_LOG_ERROR,
+                gf_msg(this->name,  GF_LOG_ERROR, 0,
+                        READDIR_AHEAD_MSG_XLATOR_CHILD_MISCONFIGURED,
                         "FATAL: readdir-ahead not configured with exactly one"
                         " child");
                 goto err;
         }
 
         if (!this->parents) {
-                gf_log(this->name, GF_LOG_WARNING,
+                gf_msg(this->name, GF_LOG_WARNING, 0,
+                        READDIR_AHEAD_MSG_VOL_MISCONFIGURED,
                         "dangling volume. check volfile ");
         }
 

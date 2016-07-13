@@ -9,14 +9,11 @@
 */
 
 
-#ifndef _CONFIG_H
-#define _CONFIG_H
-#include "config.h"
-#endif
-
 #include "afr.h"
 #include "afr-self-heal.h"
 #include "byte-order.h"
+#include "protocol-common.h"
+#include "afr-messages.h"
 
 enum {
 	AFR_SELFHEAL_DATA_FULL = 0,
@@ -31,13 +28,18 @@ __checksum_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
 		dict_t *xdata)
 {
 	afr_local_t *local = NULL;
+        struct afr_reply *replies = NULL;
 	int i = (long) cookie;
 
 	local = frame->local;
+        replies = local->replies;
 
-	local->replies[i].valid = 1;
-	local->replies[i].op_ret = op_ret;
-	local->replies[i].op_errno = op_errno;
+	replies[i].valid = 1;
+	replies[i].op_ret = op_ret;
+	replies[i].op_errno = op_errno;
+        if (xdata)
+                replies[i].buf_has_zeroes = dict_get_str_boolean (xdata,
+                                                   "buf-has-zeroes", _gf_false);
 	if (strong)
 		memcpy (local->replies[i].checksum, strong, MD5_DIGEST_LENGTH);
 
@@ -73,19 +75,23 @@ attr_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
 
 
 static gf_boolean_t
-__afr_selfheal_data_checksums_match (call_frame_t *frame, xlator_t *this,
-				     fd_t *fd, int source,
-				     unsigned char *healed_sinks,
-				     off_t offset, size_t size)
+__afr_can_skip_data_block_heal (call_frame_t *frame, xlator_t *this, fd_t *fd,
+                                int source, unsigned char *healed_sinks,
+				off_t offset, size_t size,
+                                struct iatt *poststat)
 {
 	afr_private_t *priv = NULL;
 	afr_local_t *local = NULL;
 	unsigned char *wind_subvols = NULL;
+        gf_boolean_t checksum_match = _gf_true;
+        dict_t *xdata = NULL;
 	int i = 0;
 
 	priv = this->private;
 	local = frame->local;
-
+        xdata = dict_new();
+        if (xdata)
+                i = dict_set_int32 (xdata, "check-zero-filled", 1);
 	wind_subvols = alloca0 (priv->child_count);
 	for (i = 0; i < priv->child_count; i++) {
 		if (i == source || healed_sinks[i])
@@ -93,7 +99,9 @@ __afr_selfheal_data_checksums_match (call_frame_t *frame, xlator_t *this,
 	}
 
 	AFR_ONLIST (wind_subvols, frame, __checksum_cbk, rchecksum, fd,
-		    offset, size, NULL);
+		    offset, size, xdata);
+        if (xdata)
+                dict_unref (xdata);
 
 	if (!local->replies[source].valid || local->replies[source].op_ret != 0)
 		return _gf_false;
@@ -101,21 +109,64 @@ __afr_selfheal_data_checksums_match (call_frame_t *frame, xlator_t *this,
 	for (i = 0; i < priv->child_count; i++) {
 		if (i == source)
 			continue;
-		if (memcmp (local->replies[source].checksum,
-			    local->replies[i].checksum,
-			    MD5_DIGEST_LENGTH))
-			return _gf_false;
+                if (local->replies[i].valid) {
+                        if (memcmp (local->replies[source].checksum,
+                                    local->replies[i].checksum,
+                                    MD5_DIGEST_LENGTH)) {
+                                checksum_match = _gf_false;
+                                break;
+                        }
+                }
 	}
 
-	return _gf_true;
+        if (checksum_match) {
+                if (HAS_HOLES (poststat))
+                        return _gf_true;
+
+                /* For non-sparse files, we might be better off writing the
+                 * zeroes to sinks to avoid mismatch of disk-usage in bricks. */
+                if (local->replies[source].buf_has_zeroes)
+                        return _gf_false;
+                else
+                        return _gf_true;
+        }
+
+        return _gf_false;
 }
 
+
+static gf_boolean_t
+__afr_is_sink_zero_filled (xlator_t *this, fd_t *fd, size_t size,
+                           off_t offset, int sink)
+{
+        afr_private_t *priv   = NULL;
+        struct iobref *iobref = NULL;
+        struct iovec  *iovec  = NULL;
+        int            count  = 0;
+        int            ret    = 0;
+        gf_boolean_t   zero_filled   = _gf_false;
+
+        priv = this->private;
+        ret = syncop_readv (priv->children[sink], fd, size, offset, 0, &iovec,
+                            &count, &iobref, NULL, NULL);
+        if (ret < 0)
+                goto out;
+        ret = iov_0filled (iovec, count);
+        if (!ret)
+                zero_filled = _gf_true;
+out:
+        if (iovec)
+                GF_FREE (iovec);
+        if (iobref)
+                iobref_unref (iobref);
+        return zero_filled;
+}
 
 static int
 __afr_selfheal_data_read_write (call_frame_t *frame, xlator_t *this, fd_t *fd,
 				int source, unsigned char *healed_sinks,
 				off_t offset, size_t size,
-				struct afr_reply *replies)
+				struct afr_reply *replies, int type)
 {
 	struct iovec *iovec = NULL;
 	int count = 0;
@@ -127,7 +178,7 @@ __afr_selfheal_data_read_write (call_frame_t *frame, xlator_t *this, fd_t *fd,
 	priv = this->private;
 
 	ret = syncop_readv (priv->children[source], fd, size, offset, 0,
-			    &iovec, &count, &iobref);
+			    &iovec, &count, &iobref, NULL, NULL);
 	if (ret <= 0)
 		return ret;
 
@@ -165,8 +216,18 @@ __afr_selfheal_data_read_write (call_frame_t *frame, xlator_t *this, fd_t *fd,
 		    (iov_0filled (iovec, count) == 0))
 			continue;
 
+                /* Avoid filling up sparse regions of the sink with 0-filled
+                 * writes.*/
+                if (type == AFR_SELFHEAL_DATA_FULL &&
+                    HAS_HOLES ((&replies[source].poststat)) &&
+                    ((offset + size) <= replies[i].poststat.ia_size) &&
+                    (iov_0filled (iovec, count) == 0) &&
+                    __afr_is_sink_zero_filled (this, fd, size, offset, i)) {
+                                continue;
+                }
+
 		ret = syncop_writev (priv->children[i], fd, iovec, count,
-				     offset, iobref, 0);
+				     offset, iobref, 0, NULL, NULL);
 		if (ret != iov_length (iovec, count)) {
 			/* write() failed on this sink. unset the corresponding
 			   member in sinks[] (which is healed_sinks[] in the
@@ -183,7 +244,6 @@ __afr_selfheal_data_read_write (call_frame_t *frame, xlator_t *this, fd_t *fd,
 
 	return ret;
 }
-
 
 static int
 afr_selfheal_data_block (call_frame_t *frame, xlator_t *this, fd_t *fd,
@@ -208,15 +268,16 @@ afr_selfheal_data_block (call_frame_t *frame, xlator_t *this, fd_t *fd,
 		}
 
 		if (type == AFR_SELFHEAL_DATA_DIFF &&
-		    __afr_selfheal_data_checksums_match (frame, this, fd, source,
-							 healed_sinks, offset, size)) {
+		    __afr_can_skip_data_block_heal (frame, this, fd, source,
+					            healed_sinks, offset, size,
+                                                   &replies[source].poststat)) {
 			ret = 0;
 			goto unlock;
 		}
 
 		ret = __afr_selfheal_data_read_write (frame, this, fd, source,
 						      healed_sinks, offset, size,
-						      replies);
+						      replies, type);
 	}
 unlock:
 	afr_selfheal_uninodelk (frame, this, fd->inode, this->name,
@@ -236,6 +297,9 @@ afr_selfheal_data_fsync (call_frame_t *frame, xlator_t *this, fd_t *fd,
 
 	local = frame->local;
 	priv = this->private;
+
+        if (!priv->ensure_durability)
+                return 0;
 
 	AFR_ONLIST (healed_sinks, frame, attr_cbk, fsync, fd, 0, NULL);
 
@@ -258,7 +322,7 @@ afr_selfheal_data_restore_time (call_frame_t *frame, xlator_t *this,
 	loc_t loc = {0, };
 
 	loc.inode = inode_ref (inode);
-	uuid_copy (loc.gfid, inode->gfid);
+	gf_uuid_copy (loc.gfid, inode->gfid);
 
 	AFR_ONLIST (healed_sinks, frame, attr_cbk, setattr, &loc,
 		    &replies[source].poststat,
@@ -305,15 +369,22 @@ afr_selfheal_data_do (call_frame_t *frame, xlator_t *this, fd_t *fd,
 	int type = AFR_SELFHEAL_DATA_FULL;
 	int ret = -1;
 	call_frame_t *iter_frame = NULL;
+        unsigned char arbiter_sink_status = 0;
 
 	priv = this->private;
+        if (priv->arbiter_count) {
+                arbiter_sink_status = healed_sinks[ARBITER_BRICK_INDEX];
+                healed_sinks[ARBITER_BRICK_INDEX] = 0;
+        }
 
         type = afr_data_self_heal_type_get (priv, healed_sinks, source,
                                             replies);
 
 	iter_frame = afr_copy_frame (frame);
-	if (!iter_frame)
-		return -ENOMEM;
+	if (!iter_frame) {
+                ret = -ENOMEM;
+                goto out;
+        }
 
 	for (off = 0; off < replies[source].poststat.ia_size; off += block) {
                 if (AFR_COUNT (healed_sinks, priv->child_count) == 0) {
@@ -328,14 +399,18 @@ afr_selfheal_data_do (call_frame_t *frame, xlator_t *this, fd_t *fd,
 			goto out;
 
 		AFR_STACK_RESET (iter_frame);
+		if (iter_frame->local == NULL) {
+		        ret = -ENOTCONN;
+		        goto out;
+                }
 	}
-
-	afr_selfheal_data_restore_time (frame, this, fd->inode, source,
-					healed_sinks, replies);
 
 	ret = afr_selfheal_data_fsync (frame, this, fd, healed_sinks);
 
 out:
+        if (arbiter_sink_status)
+                healed_sinks[ARBITER_BRICK_INDEX] = arbiter_sink_status;
+
 	if (iter_frame)
 		AFR_STACK_DESTROY (iter_frame);
 	return ret;
@@ -345,23 +420,22 @@ out:
 static int
 __afr_selfheal_truncate_sinks (call_frame_t *frame, xlator_t *this,
 			       fd_t *fd, unsigned char *healed_sinks,
-			       struct afr_reply *replies, uint64_t size)
+			       uint64_t size)
 {
 	afr_local_t *local = NULL;
 	afr_private_t *priv = NULL;
-	unsigned char *larger_sinks = 0;
+        unsigned char arbiter_sink_status = 0;
 	int i = 0;
 
 	local = frame->local;
 	priv = this->private;
 
-	larger_sinks = alloca0 (priv->child_count);
-	for (i = 0; i < priv->child_count; i++) {
-		if (healed_sinks[i] && replies[i].poststat.ia_size > size)
-			larger_sinks[i] = 1;
-	}
+        if (priv->arbiter_count) {
+                arbiter_sink_status = healed_sinks[ARBITER_BRICK_INDEX];
+                healed_sinks[ARBITER_BRICK_INDEX] = 0;
+        }
 
-	AFR_ONLIST (larger_sinks, frame, attr_cbk, ftruncate, fd, size, NULL);
+	AFR_ONLIST (healed_sinks, frame, attr_cbk, ftruncate, fd, size, NULL);
 
 	for (i = 0; i < priv->child_count; i++)
 		if (healed_sinks[i] && local->replies[i].op_ret == -1)
@@ -369,6 +443,9 @@ __afr_selfheal_truncate_sinks (call_frame_t *frame, xlator_t *this,
 			   as successfully healed. Mark it so.
 			*/
 			healed_sinks[i] = 0;
+
+        if (arbiter_sink_status)
+                healed_sinks[ARBITER_BRICK_INDEX] = arbiter_sink_status;
 	return 0;
 }
 
@@ -406,6 +483,13 @@ afr_does_size_mismatch (xlator_t *this, unsigned char *sources,
                 if (replies[i].op_ret < 0)
                         continue;
 
+                if (!sources[i])
+                        continue;
+
+                if (AFR_IS_ARBITER_BRICK (priv, i) &&
+                    (replies[i].poststat.ia_size == 0))
+                        continue;
+
                 if (!min)
                         min = &replies[i].poststat;
 
@@ -425,41 +509,6 @@ afr_does_size_mismatch (xlator_t *this, unsigned char *sources,
         }
 
         return _gf_false;
-}
-/*
- * If by chance there are multiple sources with differing sizes, select
- * the largest file as the source.
- *
- * This can happen if data was directly modified in the backend or for snapshots
- */
-
-static void
-afr_mark_largest_file_as_source (xlator_t *this, unsigned char *sources,
-                                 struct afr_reply *replies)
-{
-        int i = 0;
-        afr_private_t *priv = NULL;
-        uint64_t size = 0;
-
-        /* Find source with biggest file size */
-        priv = this->private;
-        for (i = 0; i < priv->child_count; i++) {
-                if (!sources[i])
-                        continue;
-                if (size <= replies[i].poststat.ia_size) {
-                        size = replies[i].poststat.ia_size;
-                }
-        }
-
-        /* Mark sources with less size as not source */
-        for (i = 0; i < priv->child_count; i++) {
-                if (!sources[i])
-                        continue;
-                if (size > replies[i].poststat.ia_size)
-                        sources[i] = 0;
-        }
-
-        return;
 }
 
 static void
@@ -518,17 +567,18 @@ afr_mark_newest_file_as_source (xlator_t *this, unsigned char *sources,
 }
 
 static int
-__afr_selfheal_data_finalize_source (xlator_t *this, unsigned char *sources,
+__afr_selfheal_data_finalize_source (call_frame_t *frame, xlator_t *this,
+                                     inode_t *inode,
+                                     unsigned char *sources,
+                                     unsigned char *sinks,
 				     unsigned char *healed_sinks,
 				     unsigned char *locked_on,
 				     struct afr_reply *replies,
                                      uint64_t *witness)
 {
-	int i = 0;
 	afr_private_t *priv = NULL;
 	int source = -1;
 	int sources_count = 0;
-
 	priv = this->private;
 
 	sources_count = AFR_COUNT (sources, priv->child_count);
@@ -536,8 +586,20 @@ __afr_selfheal_data_finalize_source (xlator_t *this, unsigned char *sources,
 	if ((AFR_CMP (locked_on, healed_sinks, priv->child_count) == 0)
             || !sources_count) {
 		/* split brain */
-		return -EIO;
+                source = afr_mark_split_brain_source_sinks (frame, this, inode,
+                                                            sources, sinks,
+                                                            healed_sinks,
+                                                            locked_on, replies,
+                                                          AFR_DATA_TRANSACTION);
+                if (source < 0)
+                        return -EIO;
+                return source;
 	}
+
+        /* No split brain at this point. If we were called from
+         * afr_heal_splitbrain_file(), abort.*/
+        if (afr_dict_contains_heal_op(frame))
+                return -EIO;
 
         /* If there are no witnesses/size-mismatches on sources we are done*/
         if (!afr_does_size_mismatch (this, sources, replies) &&
@@ -550,13 +612,9 @@ __afr_selfheal_data_finalize_source (xlator_t *this, unsigned char *sources,
 
 out:
         afr_mark_active_sinks (this, sources, locked_on, healed_sinks);
+        source = afr_choose_source_by_policy (priv, sources,
+                                              AFR_DATA_TRANSACTION);
 
-        for (i = 0; i < priv->child_count; i++) {
-                if (sources[i]) {
-                        source = i;
-                        break;
-                }
-        }
 	return source;
 }
 
@@ -569,11 +627,12 @@ out:
  * The return value is the index of the subvolume to be used as the source
  * for self-healing, or -1 if no healing is necessary/split brain.
  */
-static int
-__afr_selfheal_data_prepare (call_frame_t *frame, xlator_t *this, fd_t *fd,
-			     unsigned char *locked_on, unsigned char *sources,
-			     unsigned char *sinks, unsigned char *healed_sinks,
-			     struct afr_reply *replies)
+int
+__afr_selfheal_data_prepare (call_frame_t *frame, xlator_t *this,
+                             inode_t *inode, unsigned char *locked_on,
+                             unsigned char *sources, unsigned char *sinks,
+                             unsigned char *healed_sinks,
+			     struct afr_reply *replies, gf_boolean_t *pflag)
 {
 	int ret = -1;
 	int source = -1;
@@ -582,15 +641,17 @@ __afr_selfheal_data_prepare (call_frame_t *frame, xlator_t *this, fd_t *fd,
 
 	priv = this->private;
 
-	ret = afr_selfheal_unlocked_discover (frame, fd->inode, fd->inode->gfid,
+	ret = afr_selfheal_unlocked_discover (frame, inode, inode->gfid,
 					      replies);
-	if (ret)
-		return ret;
+
+        if (ret)
+                return ret;
 
         witness = alloca0(priv->child_count * sizeof (*witness));
 	ret = afr_selfheal_find_direction (frame, this, replies,
 					   AFR_DATA_TRANSACTION,
-					   locked_on, sources, sinks, witness);
+					   locked_on, sources, sinks, witness,
+                                           pflag);
 	if (ret)
 		return ret;
 
@@ -603,9 +664,11 @@ __afr_selfheal_data_prepare (call_frame_t *frame, xlator_t *this, fd_t *fd,
         */
         AFR_INTERSECT (healed_sinks, sinks, locked_on, priv->child_count);
 
-	source = __afr_selfheal_data_finalize_source (this, sources,
-                                                      healed_sinks, locked_on,
-                                                      replies, witness);
+	source = __afr_selfheal_data_finalize_source (frame, this, inode,
+                                                      sources, sinks,
+                                                      healed_sinks,
+                                                      locked_on, replies,
+                                                      witness);
 	if (source < 0)
 		return -EIO;
 
@@ -625,8 +688,8 @@ __afr_selfheal_data (call_frame_t *frame, xlator_t *this, fd_t *fd,
 	unsigned char *healed_sinks = NULL;
 	struct afr_reply *locked_replies = NULL;
 	int source = -1;
-	gf_boolean_t compat = _gf_false;
-	unsigned char *compat_lock = NULL;
+        gf_boolean_t did_sh = _gf_true;
+        gf_boolean_t is_arbiter_the_only_sink = _gf_false;
 
 	priv = this->private;
 
@@ -634,7 +697,6 @@ __afr_selfheal_data (call_frame_t *frame, xlator_t *this, fd_t *fd,
 	sinks = alloca0 (priv->child_count);
 	healed_sinks = alloca0 (priv->child_count);
 	data_lock = alloca0 (priv->child_count);
-	compat_lock = alloca0 (priv->child_count);
 
 	locked_replies = alloca0 (sizeof (*locked_replies) * priv->child_count);
 
@@ -642,60 +704,91 @@ __afr_selfheal_data (call_frame_t *frame, xlator_t *this, fd_t *fd,
 				    data_lock);
 	{
 		if (ret < AFR_SH_MIN_PARTICIPANTS) {
-                        gf_log (this->name, GF_LOG_DEBUG, "%s: Skipping "
-                                "self-heal as only %d number of subvolumes "
-                                "could be locked", uuid_utoa (fd->inode->gfid),
-                                ret);
+                        gf_msg_debug (this->name, 0, "%s: Skipping "
+                                      "self-heal as only %d number "
+                                      "of subvolumes "
+                                      "could be locked",
+                                      uuid_utoa (fd->inode->gfid),
+                                      ret);
 			ret = -ENOTCONN;
 			goto unlock;
 		}
 
-		ret = __afr_selfheal_data_prepare (frame, this, fd, data_lock,
-						   sources, sinks, healed_sinks,
-						   locked_replies);
+		ret = __afr_selfheal_data_prepare (frame, this, fd->inode,
+                                                   data_lock, sources, sinks,
+                                                   healed_sinks,
+						   locked_replies,
+                                                   NULL);
 		if (ret < 0)
 			goto unlock;
 
+                if (AFR_COUNT(healed_sinks, priv->child_count) == 0) {
+                        did_sh = _gf_false;
+                        goto unlock;
+                }
+
 		source = ret;
 
+                if (AFR_IS_ARBITER_BRICK(priv, source)) {
+                        did_sh = _gf_false;
+                        goto unlock;
+                }
+
+                if (priv->arbiter_count &&
+                    AFR_COUNT (healed_sinks, priv->child_count) == 1 &&
+                    healed_sinks[ARBITER_BRICK_INDEX]) {
+                        is_arbiter_the_only_sink = _gf_true;
+                        goto restore_time;
+                }
+
 		ret = __afr_selfheal_truncate_sinks (frame, this, fd, healed_sinks,
-						     locked_replies,
 						     locked_replies[source].poststat.ia_size);
 		if (ret < 0)
 			goto unlock;
 
 		ret = 0;
 
-		/* Locking from (LLONG_MAX - 2) to (LLONG_MAX - 1) is for
-		   compatibility with older self-heal clients which do not
-		   hold a lock in the @priv->sh_domain domain to guard
-		   against concurrent ongoing self-heals
-		*/
-		afr_selfheal_inodelk (frame, this, fd->inode, this->name,
-				      LLONG_MAX - 2, 1, compat_lock);
-		compat = _gf_true;
 	}
 unlock:
 	afr_selfheal_uninodelk (frame, this, fd->inode, this->name, 0, 0,
 				data_lock);
-	if (ret < 0)
+        if (ret < 0)
 		goto out;
+
+        if (!did_sh)
+                goto out;
 
 	ret = afr_selfheal_data_do (frame, this, fd, source, healed_sinks,
 				    locked_replies);
 	if (ret)
-		goto out;
+                goto out;
+restore_time:
+	afr_selfheal_data_restore_time (frame, this, fd->inode, source,
+					healed_sinks, locked_replies);
 
-	ret = afr_selfheal_undo_pending (frame, this, fd->inode, sources, sinks,
-					 healed_sinks, AFR_DATA_TRANSACTION,
-					 locked_replies, data_lock);
+        if (!is_arbiter_the_only_sink) {
+                ret = afr_selfheal_inodelk (frame, this, fd->inode, this->name,
+                                            0, 0, data_lock);
+                if (ret < AFR_SH_MIN_PARTICIPANTS) {
+                        ret = -ENOTCONN;
+                        did_sh = _gf_false;
+                        goto skip_undo_pending;
+                }
+        }
+        ret = afr_selfheal_undo_pending (frame, this, fd->inode,
+                                         sources, sinks, healed_sinks,
+                                         AFR_DATA_TRANSACTION,
+                                         locked_replies, data_lock);
+skip_undo_pending:
+	afr_selfheal_uninodelk (frame, this, fd->inode, this->name, 0, 0,
+				data_lock);
 out:
-	if (compat)
-		afr_selfheal_uninodelk (frame, this, fd->inode, this->name,
-					LLONG_MAX - 2, 1, compat_lock);
 
-        afr_log_selfheal (fd->inode->gfid, this, ret, "data", source,
-                          healed_sinks);
+        if (did_sh)
+                afr_log_selfheal (fd->inode->gfid, this, ret, "data", source,
+                                  sources, healed_sinks);
+        else
+                ret = 1;
 
         if (locked_replies)
                 afr_replies_wipe (locked_replies, priv->child_count);
@@ -704,33 +797,33 @@ out:
 }
 
 
-static fd_t *
-afr_selfheal_data_open (xlator_t *this, inode_t *inode)
+int
+afr_selfheal_data_open (xlator_t *this, inode_t *inode, fd_t **fd)
 {
-	loc_t loc = {0,};
-	int ret = 0;
-	fd_t *fd = NULL;
+	int         ret    = 0;
+        fd_t       *fd_tmp = NULL;
+	loc_t       loc    = {0,};
 
-	fd = fd_create (inode, 0);
-	if (!fd)
-		return NULL;
+	fd_tmp = fd_create (inode, 0);
+	if (!fd_tmp)
+		return -ENOMEM;
 
 	loc.inode = inode_ref (inode);
-	uuid_copy (loc.gfid, inode->gfid);
+	gf_uuid_copy (loc.gfid, inode->gfid);
 
-	ret = syncop_open (this, &loc, O_RDWR|O_LARGEFILE, fd);
-	if (ret) {
-		fd_unref (fd);
-		fd = NULL;
+	ret = syncop_open (this, &loc, O_RDWR|O_LARGEFILE, fd_tmp, NULL, NULL);
+	if (ret < 0) {
+		fd_unref (fd_tmp);
+                goto out;
 	} else {
-		fd_bind (fd);
+		fd_bind (fd_tmp);
 	}
 
-	loc_wipe (&loc);
-
-	return fd;
+        *fd = fd_tmp;
+out:
+        loc_wipe (&loc);
+	return ret;
 }
-
 
 int
 afr_selfheal_data (call_frame_t *frame, xlator_t *this, inode_t *inode)
@@ -742,22 +835,24 @@ afr_selfheal_data (call_frame_t *frame, xlator_t *this, inode_t *inode)
 
 	priv = this->private;
 
-	fd = afr_selfheal_data_open (this, inode);
+	ret = afr_selfheal_data_open (this, inode, &fd);
 	if (!fd) {
-                gf_log (this->name, GF_LOG_DEBUG, "%s: Failed to open",
-                        uuid_utoa (inode->gfid));
+                gf_msg_debug (this->name, -ret, "%s: Failed to open",
+                              uuid_utoa (inode->gfid));
                 return -EIO;
         }
 
 	locked_on = alloca0 (priv->child_count);
 
-	ret = afr_selfheal_tryinodelk (frame, this, inode, priv->sh_domain, 0, 0,
-				       locked_on);
+	ret = afr_selfheal_tie_breaker_inodelk (frame, this, inode,
+	                                        priv->sh_domain, 0, 0,
+				                locked_on);
 	{
 		if (ret < AFR_SH_MIN_PARTICIPANTS) {
-                        gf_log (this->name, GF_LOG_DEBUG, "%s: Skipping "
-                                "self-heal as only %d number of subvolumes "
-                                "could be locked", uuid_utoa (fd->inode->gfid),
+                        gf_msg_debug (this->name, 0, "%s: Skipping "
+                                      "self-heal as only %d number of "
+                                      "subvolumes could be locked",
+                                      uuid_utoa (fd->inode->gfid),
                                 ret);
 			/* Either less than two subvols available, or another
 			   selfheal (from another server) is in progress. Skip
@@ -770,7 +865,8 @@ afr_selfheal_data (call_frame_t *frame, xlator_t *this, inode_t *inode)
 		ret = __afr_selfheal_data (frame, this, fd, locked_on);
 	}
 unlock:
-	afr_selfheal_uninodelk (frame, this, inode, priv->sh_domain, 0, 0, locked_on);
+	afr_selfheal_uninodelk (frame, this, inode, priv->sh_domain, 0, 0,
+	                        locked_on);
 
 	if (fd)
 		fd_unref (fd);

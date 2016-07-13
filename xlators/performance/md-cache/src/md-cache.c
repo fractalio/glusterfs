@@ -8,12 +8,8 @@
   cases as published by the Free Software Foundation.
 */
 
-#ifndef _CONFIG_H
-#define _CONFIG_H
-#include "config.h"
-#endif
-
 #include "glusterfs.h"
+#include "defaults.h"
 #include "logging.h"
 #include "dict.h"
 #include "xlator.h"
@@ -22,6 +18,7 @@
 #include "glusterfs-acl.h"
 #include <assert.h>
 #include <sys/time.h>
+#include "md-cache-messages.h"
 
 
 /* TODO:
@@ -35,6 +32,8 @@ struct mdc_conf {
 	gf_boolean_t cache_posix_acl;
 	gf_boolean_t cache_selinux;
 	gf_boolean_t force_readdirp;
+        gf_boolean_t cache_swift_metadata;
+        gf_boolean_t cache_samba_metadata;
 };
 
 
@@ -54,10 +53,35 @@ static struct mdc_key {
 		.check = 1,
 	},
 	{
+		.name = GF_POSIX_ACL_ACCESS,
+		.load = 0,
+		.check = 1,
+	},
+	{
+		.name = GF_POSIX_ACL_DEFAULT,
+		.load = 0,
+		.check = 1,
+	},
+	{
 		.name = GF_SELINUX_XATTR_KEY,
 		.load = 0,
 		.check = 1,
 	},
+        {
+                .name = "user.swift.metadata",
+                .load = 0,
+                .check = 1,
+        },
+        {
+                .name = "user.DOSATTRIB",
+                .load = 0,
+                .check = 1,
+        },
+        {
+                .name = "security.NTACL",
+                .load = 0,
+                .check = 1,
+        },
 	{
 		.name = "security.capability",
 		.load = 0,
@@ -282,8 +306,8 @@ mdc_inode_prep (xlator_t *this, inode_t *inode)
 
                 mdc = GF_CALLOC (sizeof (*mdc), 1, gf_mdc_mt_md_cache_t);
                 if (!mdc) {
-                        gf_log (this->name, GF_LOG_ERROR,
-                                "out of memory :(");
+                        gf_msg (this->name, GF_LOG_ERROR, ENOMEM,
+                                MD_CACHE_MSG_NO_MEMORY, "out of memory");
                         goto unlock;
                 }
 
@@ -291,8 +315,8 @@ mdc_inode_prep (xlator_t *this, inode_t *inode)
 
                 ret = __mdc_inode_ctx_set (this, inode, mdc);
                 if (ret) {
-                        gf_log (this->name, GF_LOG_ERROR,
-                                "out of memory :(");
+                        gf_msg (this->name, GF_LOG_ERROR, ENOMEM,
+                                MD_CACHE_MSG_NO_MEMORY, "out of memory");
                         GF_FREE (mdc);
                         mdc = NULL;
                 }
@@ -454,7 +478,7 @@ mdc_inode_iatt_get (xlator_t *this, inode_t *inode, struct iatt *iatt)
         }
         UNLOCK (&mdc->lock);
 
-        uuid_copy (iatt->ia_gfid, inode->gfid);
+        gf_uuid_copy (iatt->ia_gfid, inode->gfid);
         iatt->ia_ino    = gfid_to_ino (inode->gfid);
         iatt->ia_dev    = 42;
         iatt->ia_type   = inode->ia_type;
@@ -726,6 +750,50 @@ mdc_load_reqs (xlator_t *this, dict_t *dict)
 }
 
 
+static char*
+mdc_serialize_loaded_key_names (xlator_t *this)
+{
+        int             max_len = 0;
+        int             len = 0;
+        int             i = 0;
+        char           *mdc_key_names = NULL;
+        const char     *mdc_key = NULL;
+        gf_boolean_t    at_least_one_key_loaded = _gf_false;
+
+        for (mdc_key = mdc_keys[i].name; (mdc_key = mdc_keys[i].name); i++) {
+                max_len += (strlen(mdc_keys[i].name) + 1);
+                if (mdc_keys[i].load)
+                        at_least_one_key_loaded = _gf_true;
+        }
+
+        if (!at_least_one_key_loaded)
+                goto out;
+
+        mdc_key_names = GF_CALLOC (1, max_len + 1, gf_common_mt_char);
+        if (!mdc_key_names)
+                goto out;
+
+        i = 0;
+        for (mdc_key = mdc_keys[i].name; (mdc_key = mdc_keys[i].name); i++) {
+                if (!mdc_keys[i].load)
+                        continue;
+                strcat (mdc_key_names, mdc_keys[i].name);
+                strcat (mdc_key_names, " ");
+        }
+
+        len = strlen (mdc_key_names);
+        if (len > 0) {
+                mdc_key_names[len - 1] = '\0';
+        } else {
+                GF_FREE (mdc_key_names);
+                mdc_key_names = NULL;
+        }
+
+out:
+        return mdc_key_names;
+}
+
+
 struct checkpair {
 	int  ret;
 	dict_t *rsp;
@@ -824,14 +892,14 @@ mdc_lookup (call_frame_t *frame, xlator_t *this, loc_t *loc,
         if (!local)
                 goto uncached;
 
+        loc_copy (&local->loc, loc);
+
 	if (!loc->name)
-		/* A nameless discovery is dangerous to cache. We
+		/* A nameless discovery is dangerous to serve from cache. We
 		   perform nameless lookup with the intention of
 		   re-establishing an inode "properly"
 		*/
 		goto uncached;
-
-        loc_copy (&local->loc, loc);
 
         ret = mdc_inode_iatt_get (this, loc->inode, &stbuf);
         if (ret != 0)
@@ -1754,7 +1822,7 @@ mdc_getxattr_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
 {
         mdc_local_t  *local = NULL;
 
-        if (op_ret != 0)
+        if (op_ret < 0)
                 goto out;
 
         local = frame->local;
@@ -1816,7 +1884,7 @@ mdc_fgetxattr_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
 {
         mdc_local_t  *local = NULL;
 
-        if (op_ret != 0)
+        if (op_ret < 0)
                 goto out;
 
         local = frame->local;
@@ -1958,6 +2026,40 @@ mdc_fremovexattr (call_frame_t *frame, xlator_t *this, fd_t *fd,
         STACK_WIND (frame, mdc_fremovexattr_cbk,
                     FIRST_CHILD(this), FIRST_CHILD(this)->fops->fremovexattr,
                     fd, name, xdata);
+        return 0;
+}
+
+
+int
+mdc_opendir(call_frame_t *frame, xlator_t *this, loc_t *loc,
+            fd_t *fd, dict_t *xdata)
+{
+        int          ret = -1;
+        char        *mdc_key_names = NULL;
+        dict_t      *xattr_alloc = NULL;
+
+        if (!xdata)
+                xdata = xattr_alloc = dict_new ();
+
+        if (xdata) {
+                /* Tell readdir-ahead to include these keys in xdata when it
+                 * internally issues readdirp() in it's opendir_cbk */
+                mdc_key_names = mdc_serialize_loaded_key_names(this);
+                if (!mdc_key_names)
+                        goto wind;
+                ret = dict_set_dynstr (xdata, GF_MDC_LOADED_KEY_NAMES,
+                                       mdc_key_names);
+                if (ret)
+                        goto wind;
+        }
+
+wind:
+        STACK_WIND (frame, default_opendir_cbk, FIRST_CHILD(this),
+                    FIRST_CHILD(this)->fops->opendir, loc, fd, xdata);
+
+        if (xattr_alloc)
+                dict_unref (xattr_alloc);
+
         return 0;
 }
 
@@ -2213,6 +2315,19 @@ reconfigure (xlator_t *this, dict_t *options)
 
 	GF_OPTION_RECONF ("cache-posix-acl", conf->cache_posix_acl, options, bool, out);
 	mdc_key_load_set (mdc_keys, "system.posix_acl_", conf->cache_posix_acl);
+	mdc_key_load_set (mdc_keys, "glusterfs.posix_acl.", conf->cache_posix_acl);
+
+        GF_OPTION_RECONF ("cache-swift-metadata", conf->cache_swift_metadata,
+                          options, bool, out);
+        mdc_key_load_set (mdc_keys, "user.swift.metadata",
+                          conf->cache_swift_metadata);
+
+        GF_OPTION_RECONF ("cache-samba-metadata", conf->cache_samba_metadata,
+                          options, bool, out);
+        mdc_key_load_set (mdc_keys, "user.DOSATTRIB",
+                          conf->cache_samba_metadata);
+        mdc_key_load_set (mdc_keys, "security.NTACL",
+                          conf->cache_samba_metadata);
 
 	GF_OPTION_RECONF("force-readdirp", conf->force_readdirp, options, bool, out);
 
@@ -2236,8 +2351,8 @@ init (xlator_t *this)
 
 	conf = GF_CALLOC (sizeof (*conf), 1, gf_mdc_mt_mdc_conf_t);
 	if (!conf) {
-		gf_log (this->name, GF_LOG_ERROR,
-			"out of memory");
+                gf_msg (this->name, GF_LOG_ERROR, ENOMEM,
+                        MD_CACHE_MSG_NO_MEMORY, "out of memory");
 		return -1;
 	}
 
@@ -2248,6 +2363,19 @@ init (xlator_t *this)
 
 	GF_OPTION_INIT ("cache-posix-acl", conf->cache_posix_acl, bool, out);
 	mdc_key_load_set (mdc_keys, "system.posix_acl_", conf->cache_posix_acl);
+	mdc_key_load_set (mdc_keys, "glusterfs.posix_acl.", conf->cache_posix_acl);
+
+        GF_OPTION_INIT ("cache-swift-metadata",
+                        conf->cache_swift_metadata, bool, out);
+        mdc_key_load_set (mdc_keys, "user.swift.metadata",
+                          conf->cache_swift_metadata);
+
+        GF_OPTION_INIT ("cache-samba-metadata", conf->cache_samba_metadata,
+                        bool, out);
+        mdc_key_load_set (mdc_keys, "user.DOSATTRIB",
+                          conf->cache_samba_metadata);
+        mdc_key_load_set (mdc_keys, "security.NTACL",
+                          conf->cache_samba_metadata);
 
 	GF_OPTION_INIT("force-readdirp", conf->force_readdirp, bool, out);
 out:
@@ -2289,6 +2417,7 @@ struct xlator_fops fops = {
         .fgetxattr   = mdc_fgetxattr,
 	.removexattr = mdc_removexattr,
 	.fremovexattr= mdc_fremovexattr,
+        .opendir     = mdc_opendir,
 	.readdirp    = mdc_readdirp,
 	.readdir     = mdc_readdir,
 	.fallocate   = mdc_fallocate,
@@ -2306,6 +2435,17 @@ struct volume_options options[] = {
 	  .type = GF_OPTION_TYPE_BOOL,
 	  .default_value = "false",
 	},
+        { .key = {"cache-swift-metadata"},
+          .type = GF_OPTION_TYPE_BOOL,
+          .default_value = "true",
+          .description = "Cache swift metadata (user.swift.metadata xattr)",
+        },
+        { .key = {"cache-samba-metadata"},
+          .type = GF_OPTION_TYPE_BOOL,
+          .default_value = "false",
+          .description = "Cache samba metadata (user.DOSATTRIB, security.NTACL"
+                         " xattrs)",
+        },
 	{ .key = {"cache-posix-acl"},
 	  .type = GF_OPTION_TYPE_BOOL,
 	  .default_value = "false",

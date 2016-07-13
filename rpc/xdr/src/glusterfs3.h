@@ -16,6 +16,8 @@
 #include "xdr-generic.h"
 #include "glusterfs3-xdr.h"
 #include "iatt.h"
+#include "protocol-common.h"
+#include "upcall-utils.h"
 
 #define xdr_decoded_remaining_addr(xdr)        ((&xdr)->x_private)
 #define xdr_decoded_remaining_len(xdr)         ((&xdr)->x_handy)
@@ -181,6 +183,78 @@ gf_statfs_from_statfs (struct gf_statfs *gf_stat, struct statvfs *stat)
 }
 
 static inline void
+gf_proto_lease_to_lease (struct gf_proto_lease *gf_proto_lease, struct gf_lease *gf_lease)
+{
+        if (!gf_lease || !gf_proto_lease)
+                return;
+
+        gf_lease->cmd        = gf_proto_lease->cmd;
+        gf_lease->lease_type = gf_proto_lease->lease_type;
+        memcpy (gf_lease->lease_id, gf_proto_lease->lease_id, LEASE_ID_SIZE);
+}
+
+static inline void
+gf_proto_lease_from_lease (struct gf_proto_lease *gf_proto_lease, struct gf_lease *gf_lease)
+{
+        if (!gf_lease || !gf_proto_lease)
+                return;
+
+        gf_proto_lease->cmd  = gf_lease->cmd;
+        gf_proto_lease->lease_type = gf_lease->lease_type;
+        memcpy (gf_proto_lease->lease_id, gf_lease->lease_id, LEASE_ID_SIZE);
+}
+
+static inline int
+gf_proto_recall_lease_to_upcall (struct gfs3_recall_lease_req *recall_lease,
+                                 struct gf_upcall *gf_up_data)
+{
+        struct gf_upcall_recall_lease *tmp = NULL;
+        int    ret                         = 0;
+
+        GF_VALIDATE_OR_GOTO(THIS->name, recall_lease, out);
+        GF_VALIDATE_OR_GOTO(THIS->name, gf_up_data, out);
+
+        tmp = (struct gf_upcall_recall_lease *)gf_up_data->data;
+        tmp->lease_type = recall_lease->lease_type;
+        memcpy (gf_up_data->gfid, recall_lease->gfid, 16);
+        memcpy (tmp->tid, recall_lease->tid, 16);
+
+        GF_PROTOCOL_DICT_UNSERIALIZE (THIS, tmp->dict,
+                                      (recall_lease->xdata).xdata_val,
+                                      (recall_lease->xdata).xdata_len, ret,
+                                      errno, out);
+out:
+        return ret;
+
+}
+
+static inline int
+gf_proto_recall_lease_from_upcall (xlator_t *this,
+                                   struct gfs3_recall_lease_req *recall_lease,
+                                   struct gf_upcall *gf_up_data)
+{
+        struct gf_upcall_recall_lease *tmp = NULL;
+        int    ret                         = 0;
+
+        GF_VALIDATE_OR_GOTO(this->name, recall_lease, out);
+        GF_VALIDATE_OR_GOTO(this->name, gf_up_data, out);
+
+        tmp = (struct gf_upcall_recall_lease *)gf_up_data->data;
+        recall_lease->lease_type = tmp->lease_type;
+        memcpy (recall_lease->gfid, gf_up_data->gfid, 16);
+        memcpy (recall_lease->tid, tmp->tid, 16);
+
+        GF_PROTOCOL_DICT_SERIALIZE (this, tmp->dict,
+                                    &(recall_lease->xdata).xdata_val,
+                                    (recall_lease->xdata).xdata_len, ret, out);
+        if (ret > 0)
+                ret = -ret;
+out:
+        return ret;
+
+}
+
+static inline void
 gf_proto_flock_to_flock (struct gf_proto_flock *gf_proto_flock, struct gf_flock *gf_flock)
 {
         if (!gf_flock || !gf_proto_flock)
@@ -267,4 +341,80 @@ gf_stat_from_iatt (struct gf_iatt *gf_stat, struct iatt *iatt)
 	gf_stat->ia_ctime_nsec = iatt->ia_ctime_nsec ;
 }
 
+static inline int
+gf_proto_cache_invalidation_from_upcall (xlator_t *this,
+                                         gfs3_cbk_cache_invalidation_req *gf_c_req,
+                                         struct gf_upcall *gf_up_data)
+{
+        struct gf_upcall_cache_invalidation *gf_c_data = NULL;
+        int    is_cache_inval                          = 0;
+        int    ret                                     = -1;
+
+        GF_VALIDATE_OR_GOTO(this->name, gf_c_req, out);
+        GF_VALIDATE_OR_GOTO(this->name, gf_up_data, out);
+
+        is_cache_inval = ((gf_up_data->event_type ==
+                          GF_UPCALL_CACHE_INVALIDATION) ? 1 : 0);
+        GF_VALIDATE_OR_GOTO(this->name, is_cache_inval, out);
+
+        gf_c_data = (struct gf_upcall_cache_invalidation *)gf_up_data->data;
+        GF_VALIDATE_OR_GOTO(this->name, gf_c_data, out);
+
+        gf_c_req->gfid = uuid_utoa (gf_up_data->gfid);
+        gf_c_req->event_type       = gf_up_data->event_type;
+        gf_c_req->flags            = gf_c_data->flags;
+        gf_c_req->expire_time_attr = gf_c_data->expire_time_attr;
+        gf_stat_from_iatt (&gf_c_req->stat, &gf_c_data->stat);
+        gf_stat_from_iatt (&gf_c_req->parent_stat, &gf_c_data->p_stat);
+        gf_stat_from_iatt (&gf_c_req->oldparent_stat, &gf_c_data->oldp_stat);
+
+        ret = 0;
+        GF_PROTOCOL_DICT_SERIALIZE (this, gf_c_data->dict, &(gf_c_req->xdata).xdata_val,
+                                    (gf_c_req->xdata).xdata_len, ret, out);
+        if (ret > 0)
+                ret = -ret;
+out:
+        return ret;
+}
+
+static inline int
+gf_proto_cache_invalidation_to_upcall (xlator_t *this,
+                                       gfs3_cbk_cache_invalidation_req *gf_c_req,
+                                       struct gf_upcall *gf_up_data)
+{
+        struct gf_upcall_cache_invalidation *gf_c_data = NULL;
+        int    ret                                     = -1;
+
+        GF_VALIDATE_OR_GOTO(this->name, gf_c_req, out);
+        GF_VALIDATE_OR_GOTO(this->name, gf_up_data, out);
+
+        gf_c_data = (struct gf_upcall_cache_invalidation *)gf_up_data->data;
+        GF_VALIDATE_OR_GOTO(this->name, gf_c_data, out);
+
+        ret = gf_uuid_parse (gf_c_req->gfid, gf_up_data->gfid);
+        if (ret) {
+                gf_log (this->name, GF_LOG_WARNING, "gf_uuid_parse(%s) failed",
+                        gf_c_req->gfid);
+                gf_up_data->event_type = GF_UPCALL_EVENT_NULL;
+                goto out;
+        }
+
+        gf_up_data->event_type      = gf_c_req->event_type;
+
+        gf_c_data->flags            = gf_c_req->flags;
+        gf_c_data->expire_time_attr = gf_c_req->expire_time_attr;
+        gf_stat_to_iatt (&gf_c_req->stat, &gf_c_data->stat);
+        gf_stat_to_iatt (&gf_c_req->parent_stat, &gf_c_data->p_stat);
+        gf_stat_to_iatt (&gf_c_req->oldparent_stat, &gf_c_data->oldp_stat);
+
+        ret = 0;
+        GF_PROTOCOL_DICT_UNSERIALIZE (this, gf_c_data->dict,
+                                      (gf_c_req->xdata).xdata_val,
+                                      (gf_c_req->xdata).xdata_len, ret,
+                                      ret, out);
+        if (ret > 0)
+                ret = -ret;
+out:
+        return ret;
+}
 #endif /* !_GLUSTERFS3_H */

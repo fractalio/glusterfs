@@ -10,13 +10,8 @@
 #ifndef _GLUSTERD_PMAP_H_
 #define _GLUSTERD_PMAP_H_
 
-#ifndef _CONFIG_H
-#define _CONFIG_H
-#include "config.h"
-#endif
-
 #include <pthread.h>
-#include "uuid.h"
+#include "compat-uuid.h"
 
 #include "glusterfs.h"
 #include "xlator.h"
@@ -27,8 +22,6 @@
 #include "glusterd.h"
 #include "rpcsvc.h"
 
-
-#define GF_IANA_PRIV_PORTS_START 49152 /* RFC 6335 */
 
 struct pmap_port_status {
         gf_pmap_port_type_t type;

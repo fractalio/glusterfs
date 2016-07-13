@@ -8,11 +8,6 @@
   cases as published by the Free Software Foundation.
 */
 
-#ifndef _CONFIG_H
-#define _CONFIG_H
-#include "config.h"
-#endif
-
 #include "defaults.h"
 #include "crypt-common.h"
 #include "crypt.h"
@@ -165,7 +160,7 @@ static uint32_t io_size_nopad_tail(struct avec_config *conf,
 
 static uint32_t io_size_nopad_full(struct avec_config *conf,
 				   struct object_cipher_info *object)
-{	
+{
 	check_full_block(conf);
 	return get_atom_size(object);
 }
@@ -554,7 +549,7 @@ void submit_partial(call_frame_t *frame,
 	/*
 	 * To perform the "read" component of the read-modify-write
 	 * sequence the crypt translator does stack_wind to itself.
-	 * 
+	 *
 	 * Pass current file size to crypt_readv()
 	 */
 	dict = dict_new();
@@ -655,7 +650,7 @@ void submit_full(call_frame_t *frame, xlator_t *this)
 				    blocks_to_write,
 				    off_in_file + (blocks_written <<
 						   get_atom_bits(object)));
-		
+
 		set_local_io_params_writev(frame, object, atom,
 		        off_in_file + (blocks_written << get_atom_bits(object)),
 			blocks_to_write <<  get_atom_bits(object));
@@ -851,7 +846,7 @@ static struct iovec *get_iovec_hole_full(call_frame_t *frame,
 	return conf->avec + (conf->off_in_head ? 1 : 0);
 }
 
-static inline struct iovec *get_iovec_hole_tail(call_frame_t *frame,
+static struct iovec *get_iovec_hole_tail(call_frame_t *frame,
 						uint32_t count)
 {
 	struct avec_config *conf = get_hole_conf(frame);
@@ -859,7 +854,7 @@ static inline struct iovec *get_iovec_hole_tail(call_frame_t *frame,
 	return conf->avec + (conf->blocks_in_pool - 1);
 }
 
-static inline struct iovec *get_iovec_data_head(call_frame_t *frame,
+static struct iovec *get_iovec_data_head(call_frame_t *frame,
 						uint32_t count)
 {
 	struct avec_config *conf = get_data_conf(frame);
@@ -867,7 +862,7 @@ static inline struct iovec *get_iovec_data_head(call_frame_t *frame,
 	return conf->avec;
 }
 
-static inline struct iovec *get_iovec_data_full(call_frame_t *frame,
+static struct iovec *get_iovec_data_full(call_frame_t *frame,
 						uint32_t count)
 {
 	struct avec_config *conf = get_data_conf(frame);
@@ -875,7 +870,7 @@ static inline struct iovec *get_iovec_data_full(call_frame_t *frame,
 	return conf->avec + (conf->off_in_head ? 1 : 0) + count;
 }
 
-static inline struct iovec *get_iovec_data_tail(call_frame_t *frame,
+static struct iovec *get_iovec_data_tail(call_frame_t *frame,
 						uint32_t count)
 {
 	struct avec_config *conf = get_data_conf(frame);

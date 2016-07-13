@@ -9,11 +9,6 @@
 */
 
 
-#ifndef _CONFIG_H
-#define _CONFIG_H
-#include "config.h"
-#endif
-
 #include "glusterfs.h"
 #include "logging.h"
 #include "dict.h"
@@ -26,6 +21,7 @@
 #include "statedump.h"
 #include "defaults.h"
 #include "write-behind-mem-types.h"
+#include "write-behind-messages.h"
 
 #define MAX_VECTOR_COUNT          8
 #define WB_AGGREGATE_SIZE         131072 /* 128 KB */
@@ -111,6 +107,14 @@ typedef struct wb_inode {
 	size_t       size; /* Size of the file to catch write after EOF. */
         gf_lock_t    lock;
         xlator_t    *this;
+        int          dontsync; /* If positive, dont pick lies for
+                                * winding. This is needed to break infinite
+                                * recursion during invocation of
+                                * wb_process_queue from
+                                * wb_fulfill_cbk in case of an
+                                * error during fulfill.
+                                */
+
 } wb_inode_t;
 
 
@@ -148,6 +152,8 @@ typedef struct wb_request {
 				       request arrival */
 
 	fd_t                 *fd;
+        int                   wind_count;    /* number of sync-attempts. Only
+                                                for debug purposes */
 	struct {
 		size_t        size;          /* 0 size == till infinity */
 		off_t         off;
@@ -168,6 +174,7 @@ typedef struct wb_conf {
         gf_boolean_t     trickling_writes;
 	gf_boolean_t     strict_write_ordering;
 	gf_boolean_t     strict_O_DIRECT;
+        gf_boolean_t     resync_after_fsync;
 } wb_conf_t;
 
 
@@ -203,26 +210,6 @@ wb_inode_ctx_get (xlator_t *this, inode_t *inode)
         UNLOCK (&inode->lock);
 out:
         return wb_inode;
-}
-
-
-gf_boolean_t
-wb_fd_err (fd_t *fd, xlator_t *this, int32_t *op_errno)
-{
-        gf_boolean_t err   = _gf_false;
-        uint64_t     value = 0;
-        int32_t      tmp   = 0;
-
-	if (fd_ctx_get (fd, this, &value) == 0) {
-                if (op_errno) {
-                        tmp = value;
-                        *op_errno = tmp;
-                }
-
-                err = _gf_true;
-        }
-
-        return err;
 }
 
 
@@ -309,17 +296,17 @@ wb_requests_conflict (wb_request_t *lie, wb_request_t *req)
 }
 
 
-gf_boolean_t
+wb_request_t *
 wb_liability_has_conflict (wb_inode_t *wb_inode, wb_request_t *req)
 {
         wb_request_t *each     = NULL;
 
         list_for_each_entry (each, &wb_inode->liability, lie) {
 		if (wb_requests_conflict (each, req))
-			return _gf_true;
+			return each;
         }
 
-        return _gf_false;
+        return NULL;
 }
 
 
@@ -356,7 +343,8 @@ __wb_request_unref (wb_request_t *req)
 	wb_inode = req->wb_inode;
 
         if (req->refcount <= 0) {
-                gf_log ("wb-request", GF_LOG_WARNING,
+                gf_msg ("wb-request", GF_LOG_WARNING,
+                        0, WRITE_BEHIND_MSG_RES_UNAVAILABLE,
                         "refcount(%d) is <= 0", req->refcount);
                 goto out;
         }
@@ -422,7 +410,8 @@ __wb_request_ref (wb_request_t *req)
         GF_VALIDATE_OR_GOTO ("write-behind", req, out);
 
         if (req->refcount < 0) {
-                gf_log ("wb-request", GF_LOG_WARNING,
+                gf_msg ("wb-request", GF_LOG_WARNING, 0,
+                        WRITE_BEHIND_MSG_RES_UNAVAILABLE,
                         "refcount(%d) is < 0", req->refcount);
                 req = NULL;
                 goto out;
@@ -554,6 +543,9 @@ wb_enqueue_common (wb_inode_t *wb_inode, call_stub_t *stub, int tempted)
 
 		break;
 	default:
+                if (stub && stub->args.fd)
+                        req->fd = fd_ref (stub->args.fd);
+
 		break;
 	}
 
@@ -600,6 +592,7 @@ __wb_inode_create (xlator_t *this, inode_t *inode)
 {
         wb_inode_t *wb_inode = NULL;
         wb_conf_t  *conf     = NULL;
+        int         ret      = 0;
 
         GF_VALIDATE_OR_GOTO (this->name, inode, out);
 
@@ -621,7 +614,11 @@ __wb_inode_create (xlator_t *this, inode_t *inode)
 
         LOCK_INIT (&wb_inode->lock);
 
-        __inode_ctx_put (inode, this, (uint64_t)(unsigned long)wb_inode);
+        ret = __inode_ctx_put (inode, this, (uint64_t)(unsigned long)wb_inode);
+        if (ret) {
+                GF_FREE (wb_inode);
+                wb_inode = NULL;
+        }
 
 out:
         return wb_inode;
@@ -681,6 +678,141 @@ __wb_fulfill_request (wb_request_t *req)
 }
 
 
+/* get a flush/fsync waiting on req */
+wb_request_t *
+__wb_request_waiting_on (wb_request_t *req)
+{
+        wb_inode_t   *wb_inode = NULL;
+        wb_request_t *trav     = NULL;
+
+        wb_inode = req->wb_inode;
+
+        list_for_each_entry (trav, &wb_inode->todo, todo) {
+                if ((trav->fd == req->fd)
+                    && ((trav->stub->fop == GF_FOP_FLUSH)
+                        || (trav->stub->fop == GF_FOP_FSYNC))
+                    && (trav->gen >= req->gen))
+                        return trav;
+        }
+
+        return NULL;
+}
+
+
+void
+__wb_add_request_for_retry (wb_request_t *req)
+{
+        wb_inode_t *wb_inode = NULL;
+
+        if (!req)
+                goto out;
+
+        wb_inode = req->wb_inode;
+
+        /* response was unwound and no waiter waiting on this request, retry
+           till a flush or fsync (subject to conf->resync_after_fsync).
+        */
+	wb_inode->transit -= req->total_size;
+
+        req->total_size = 0;
+
+        list_del_init (&req->winds);
+        list_del_init (&req->todo);
+        list_del_init (&req->wip);
+
+        /* sanitize ordering flags to retry */
+        req->ordering.go = 0;
+
+        /* Add back to todo list to retry */
+        list_add (&req->todo, &wb_inode->todo);
+
+out:
+        return;
+}
+
+void
+__wb_add_head_for_retry (wb_request_t *head)
+{
+	wb_request_t *req      = NULL, *tmp = NULL;
+
+        if (!head)
+                goto out;
+
+        list_for_each_entry_safe_reverse (req, tmp, &head->winds,
+                                          winds) {
+                __wb_add_request_for_retry (req);
+        }
+
+        __wb_add_request_for_retry (head);
+
+out:
+        return;
+}
+
+
+void
+wb_add_head_for_retry (wb_request_t *head)
+{
+        if (!head)
+                goto out;
+
+        LOCK (&head->wb_inode->lock);
+        {
+                __wb_add_head_for_retry (head);
+        }
+        UNLOCK (&head->wb_inode->lock);
+
+out:
+        return;
+}
+
+
+void
+__wb_fulfill_request_err (wb_request_t *req, int32_t op_errno)
+{
+	wb_inode_t   *wb_inode = NULL;
+        wb_request_t *waiter   = NULL;
+        wb_conf_t    *conf     = NULL;
+
+        wb_inode = req->wb_inode;
+
+        conf = wb_inode->this->private;
+
+        req->op_ret = -1;
+        req->op_errno = op_errno;
+
+        if (req->ordering.lied)
+                waiter = __wb_request_waiting_on (req);
+
+        if (!req->ordering.lied || waiter) {
+                if (!req->ordering.lied) {
+                        /* response to app is still pending, send failure in
+                         * response.
+                         */
+                } else {
+                        /* response was sent, store the error in a
+                         * waiter (either an fsync or flush).
+                         */
+                        waiter->op_ret = -1;
+                        waiter->op_errno = op_errno;
+                }
+
+                if (!req->ordering.lied
+                    || (waiter->stub->fop == GF_FOP_FLUSH)
+                    || ((waiter->stub->fop == GF_FOP_FSYNC)
+                        && !conf->resync_after_fsync)) {
+                        /* No retry needed, forget the request */
+                        __wb_fulfill_request (req);
+                        return;
+                }
+        }
+
+        __wb_add_request_for_retry (req);
+
+        return;
+}
+
+
 void
 wb_head_done (wb_request_t *head)
 {
@@ -695,6 +827,7 @@ wb_head_done (wb_request_t *head)
 		list_for_each_entry_safe (req, tmp, &head->winds, winds) {
 			__wb_fulfill_request (req);
 		}
+
 		__wb_fulfill_request (head);
 	}
 	UNLOCK (&wb_inode->lock);
@@ -702,29 +835,149 @@ wb_head_done (wb_request_t *head)
 
 
 void
+__wb_fulfill_err (wb_request_t *head, int op_errno)
+{
+	wb_request_t *req      = NULL, *tmp = NULL;
+
+        if (!head)
+                goto out;
+
+        head->wb_inode->dontsync++;
+
+        list_for_each_entry_safe_reverse (req, tmp, &head->winds,
+                                          winds) {
+                __wb_fulfill_request_err (req, op_errno);
+        }
+
+        __wb_fulfill_request_err (head, op_errno);
+
+out:
+        return;
+}
+
+
+void
 wb_fulfill_err (wb_request_t *head, int op_errno)
 {
-	wb_inode_t *wb_inode;
-	wb_request_t *req;
+	wb_inode_t   *wb_inode = NULL;
 
 	wb_inode = head->wb_inode;
 
-	/* for all future requests yet to arrive */
-	fd_ctx_set (head->fd, THIS, op_errno);
-
 	LOCK (&wb_inode->lock);
 	{
-		/* for all requests already arrived */
-		list_for_each_entry (req, &wb_inode->all, all) {
-			if (req->fd != head->fd)
-				continue;
-			req->op_ret = -1;
-			req->op_errno = op_errno;
-		}
+                __wb_fulfill_err (head, op_errno);
+
 	}
 	UNLOCK (&wb_inode->lock);
 }
 
+
+void
+__wb_modify_write_request (wb_request_t *req, int synced_size)
+{
+        struct iovec *vector = NULL;
+        int           count  = 0;
+
+        if (!req || synced_size == 0)
+                goto out;
+
+        req->write_size -= synced_size;
+        req->stub->args.offset += synced_size;
+
+        vector = req->stub->args.vector;
+        count = req->stub->args.count;
+
+        req->stub->args.count = iov_subset (vector, count, synced_size,
+                                            iov_length (vector, count), vector);
+
+out:
+        return;
+}
+
+int
+__wb_fulfill_short_write (wb_request_t *req, int size, gf_boolean_t *fulfilled)
+{
+        int accounted_size = 0;
+
+        if (req == NULL)
+                goto out;
+
+        if (req->write_size <= size) {
+                accounted_size = req->write_size;
+                __wb_fulfill_request (req);
+                *fulfilled = 1;
+        } else {
+                accounted_size = size;
+                __wb_modify_write_request (req, size);
+        }
+
+out:
+        return accounted_size;
+}
+
+void
+wb_fulfill_short_write (wb_request_t *head, int size)
+{
+        wb_inode_t       *wb_inode       = NULL;
+        wb_request_t     *req            = NULL, *next = NULL;
+        int               accounted_size = 0;
+        gf_boolean_t      fulfilled      = _gf_false;
+
+        if (!head)
+                goto out;
+
+        wb_inode = head->wb_inode;
+
+        req = head;
+
+        LOCK (&wb_inode->lock);
+        {
+                /* hold a reference to head so that __wb_fulfill_short_write
+                 * won't free it. We need head for a cleaner list traversal as
+                 * list_for_each_entry_safe doesn't iterate over "head" member.
+                 * So, if we pass "next->winds" as head to list_for_each_entry,
+                 * "next" is skipped. For a simpler logic we need to traverse
+                 * the list in the order. So, we start traversal from
+                 * "head->winds" and hence we want head to be alive.
+                 */
+                __wb_request_ref (head);
+
+                next = list_entry (head->winds.next, wb_request_t, winds);
+
+                accounted_size = __wb_fulfill_short_write (head, size,
+                                                           &fulfilled);
+
+                size -= accounted_size;
+
+                if (size == 0) {
+                        if (fulfilled)
+                                req = next;
+
+                        goto done;
+                }
+
+                list_for_each_entry_safe (req, next, &head->winds, winds) {
+                        accounted_size = __wb_fulfill_short_write (req, size,
+                                                                   &fulfilled);
+                        size -= accounted_size;
+
+                        if (size == 0) {
+                                if (fulfilled)
+                                        req = next;
+                                break;
+                        }
+
+                }
+        }
+done:
+        UNLOCK (&wb_inode->lock);
+
+        __wb_request_unref (head);
+
+        wb_add_head_for_retry (req);
+out:
+        return;
+}
 
 int
 wb_fulfill_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
@@ -742,18 +995,10 @@ wb_fulfill_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
 	if (op_ret == -1) {
 		wb_fulfill_err (head, op_errno);
 	} else if (op_ret < head->total_size) {
-		/*
-		 * We've encountered a short write, for whatever reason.
-		 * Set an EIO error for the next fop. This should be
-		 * valid for writev or flush (close).
-		 *
-		 * TODO: Retry the write so we can potentially capture
-		 * a real error condition (i.e., ENOSPC).
-		 */
-		wb_fulfill_err (head, EIO);
-	}
-
-	wb_head_done (head);
+		wb_fulfill_short_write (head, op_ret);
+	} else {
+                wb_head_done (head);
+        }
 
         wb_process_queue (wb_inode);
 
@@ -778,10 +1023,6 @@ wb_fulfill_head (wb_inode_t *wb_inode, wb_request_t *head)
 	int           count    = 0;
 	wb_request_t *req      = NULL;
 	call_frame_t *frame    = NULL;
-        gf_boolean_t  fderr    = _gf_false;
-        xlator_t     *this     = NULL;
-
-        this = THIS;
 
         /* make sure head->total_size is updated before we run into any
          * errors
@@ -796,11 +1037,6 @@ wb_fulfill_head (wb_inode_t *wb_inode, wb_request_t *head)
 				  req->stub->args.iobref))
 			goto err;
 	}
-
-        if (wb_fd_err (head->fd, this, NULL)) {
-                fderr = _gf_true;
-                goto err;
-        }
 
 	frame = create_frame (wb_inode->this, wb_inode->this->ctx->pool);
 	if (!frame)
@@ -824,26 +1060,21 @@ wb_fulfill_head (wb_inode_t *wb_inode, wb_request_t *head)
 
 	return 0;
 err:
-        if (!fderr) {
-                /* frame creation failure */
-                fderr = ENOMEM;
-                wb_fulfill_err (head, fderr);
-        }
+        /* frame creation failure */
+        wb_fulfill_err (head, ENOMEM);
 
-	wb_head_done (head);
-
-	return fderr;
+	return ENOMEM;
 }
 
 
-#define NEXT_HEAD(head, req) do {					\
-		if (head)						\
-			ret |= wb_fulfill_head (wb_inode, head);	\
-		head = req;						\
-		expected_offset = req->stub->args.offset +		\
-			req->write_size;				\
-		curr_aggregate = 0;					\
-		vector_count = 0;					\
+#define NEXT_HEAD(head, req) do {                                       \
+		if (head)                                               \
+			ret |= wb_fulfill_head (wb_inode, head);        \
+		head = req;                                             \
+		expected_offset = req->stub->args.offset +              \
+			req->write_size;                                \
+		curr_aggregate = 0;                                     \
+		vector_count = 0;                                       \
 	} while (0)
 
 
@@ -993,7 +1224,8 @@ __wb_collapse_small_writes (wb_request_t *holder, wb_request_t *req)
 
                 ret = iobref_add (iobref, iobuf);
                 if (ret != 0) {
-                        gf_log (req->wb_inode->this->name, GF_LOG_WARNING,
+                        gf_msg (req->wb_inode->this->name, GF_LOG_WARNING,
+                                -ret, WRITE_BEHIND_MSG_INVALID_ARGUMENT,
                                 "cannot add iobuf (%p) into iobref (%p)",
                                 iobuf, iobref);
                         iobuf_unref (iobuf);
@@ -1054,6 +1286,17 @@ __wb_preprocess_winds (wb_inode_t *wb_inode)
 	conf = wb_inode->this->private;
 
         list_for_each_entry_safe (req, tmp, &wb_inode->todo, todo) {
+                if (wb_inode->dontsync && req->ordering.lied) {
+                        /* sync has failed. Don't pick lies _again_ for winding
+                         * as winding these lies again will trigger an infinite
+                         * recursion of wb_process_queue being called from a
+                         * failed fulfill. However, pick non-lied requests for
+                         * winding so that application wont block indefinitely
+                         * waiting for write result.
+                         */
+                        continue;
+                }
+
 		if (!req->ordering.tempted) {
 			if (holder) {
 				if (wb_requests_conflict (holder, req))
@@ -1125,20 +1368,106 @@ __wb_preprocess_winds (wb_inode_t *wb_inode)
 	if (conf->trickling_writes && !wb_inode->transit && holder)
 		holder->ordering.go = 1;
 
+        if (wb_inode->dontsync > 0)
+                wb_inode->dontsync--;
+
         return;
 }
 
+int
+__wb_handle_failed_conflict (wb_request_t *req, wb_request_t *conflict,
+                             list_head_t *tasks)
+{
+        wb_conf_t *conf = NULL;
 
-void
+        conf = req->wb_inode->this->private;
+
+        if ((req->stub->fop != GF_FOP_FLUSH)
+            && ((req->stub->fop != GF_FOP_FSYNC) || conf->resync_after_fsync)) {
+                if (!req->ordering.lied && list_empty (&conflict->wip)) {
+                        /* If request itself is in liability queue,
+                         * 1. We cannot unwind as the response has already been
+                         *    sent.
+                         * 2. We cannot wind till conflict clears up.
+                         * 3. So, skip the request for now.
+                         * 4. Otherwise, resume (unwind) it with error.
+                         */
+                        req->op_ret = -1;
+                        req->op_errno = conflict->op_errno;
+
+                        list_del_init (&req->todo);
+                        list_add_tail (&req->winds, tasks);
+
+                        if (req->ordering.tempted) {
+                                /* make sure that it won't be unwound in
+                                 * wb_do_unwinds too. Otherwise there'll be
+                                 * a double wind.
+                                 */
+                                list_del_init (&req->lie);
+                                __wb_fulfill_request (req);
+                        }
+
+                }
+        } else {
+                /* flush and fsync (without conf->resync_after_fsync) act as
+                   barriers. We cannot unwind them out of
+                   order, when there are earlier generation writes just because
+                   there is a conflicting liability with an error. So, wait for
+                   our turn till there are no conflicting liabilities.
+
+                   This situation can arise when there liabilities spread across
+                   multiple generations. For eg., consider two writes with
+                   following characterstics:
+
+                   1. they belong to different generations gen1, gen2 and
+                      (gen1 > gen2).
+                   2. they overlap.
+                   3. both are liabilities.
+                   4. gen1 write was attempted to sync, but the attempt failed.
+                   5. there was no attempt to sync gen2 write yet.
+                   6. A flush (as part of close) is issued and gets a gen no
+                      gen3.
+
+                   In the above scenario, if flush is unwound without waiting
+                   for gen1 and gen2 writes either to be successfully synced or
+                   purged, we end up with these two writes in wb_inode->todo
+                   list forever as there will be no attempt to process the queue
+                   as flush is the last operation.
+                */
+        }
+
+        return 0;
+}
+
+
+int
 __wb_pick_winds (wb_inode_t *wb_inode, list_head_t *tasks,
 		 list_head_t *liabilities)
 {
-	wb_request_t *req = NULL;
-	wb_request_t *tmp = NULL;
+	wb_request_t *req                 = NULL;
+	wb_request_t *tmp                 = NULL;
+        wb_request_t *conflict            = NULL;
 
 	list_for_each_entry_safe (req, tmp, &wb_inode->todo, todo) {
-		if (wb_liability_has_conflict (wb_inode, req))
-			continue;
+                conflict = wb_liability_has_conflict (wb_inode, req);
+                if (conflict) {
+                        if (conflict->op_ret == -1) {
+                                /* There is a conflicting liability which failed
+                                 * to sync in previous attempts, resume the req
+                                 * and fail, unless its an fsync/flush.
+                                 */
+
+                                __wb_handle_failed_conflict (req, conflict,
+                                                             tasks);
+                        } else {
+                                /* There is a conflicting liability which was
+                                 * not attempted to sync even once. Wait till
+                                 * atleast one attempt to sync is made.
+                                 */
+                        }
+
+                        continue;
+                }
 
 		if (req->ordering.tempted && !req->ordering.go)
 			/* wait some more */
@@ -1149,6 +1478,7 @@ __wb_pick_winds (wb_inode_t *wb_inode, list_head_t *tasks,
 				continue;
 
 			list_add_tail (&req->wip, &wb_inode->wip);
+                        req->wind_count++;
 
 			if (!req->ordering.tempted)
 				/* unrefed in wb_writev_cbk */
@@ -1163,6 +1493,8 @@ __wb_pick_winds (wb_inode_t *wb_inode, list_head_t *tasks,
 		else
 			list_add_tail (&req->winds, tasks);
 	}
+
+        return 0;
 }
 
 
@@ -1175,8 +1507,14 @@ wb_do_winds (wb_inode_t *wb_inode, list_head_t *tasks)
 	list_for_each_entry_safe (req, tmp, tasks, winds) {
 		list_del_init (&req->winds);
 
-		call_resume (req->stub);
+                if (req->op_ret == -1) {
+                        call_unwind_error (req->stub, req->op_ret,
+                                           req->op_errno);
+                } else {
+                        call_resume (req->stub);
+                }
 
+                req->stub = NULL;
 		wb_request_unref (req);
 	}
 }
@@ -1185,10 +1523,10 @@ wb_do_winds (wb_inode_t *wb_inode, list_head_t *tasks)
 void
 wb_process_queue (wb_inode_t *wb_inode)
 {
-        list_head_t tasks  = {0, };
-	list_head_t lies = {0, };
-	list_head_t liabilities = {0, };
-        int         retry       = 0;
+        list_head_t tasks        = {0, };
+	list_head_t lies         = {0, };
+	list_head_t liabilities  = {0, };
+        int         wind_failure = 0;
 
         INIT_LIST_HEAD (&tasks);
         INIT_LIST_HEAD (&lies);
@@ -1210,13 +1548,12 @@ wb_process_queue (wb_inode_t *wb_inode)
 
                 wb_do_winds (wb_inode, &tasks);
 
-                /* fd might've been marked bad due to previous errors.
-                 * Since, caller of wb_process_queue might be the last fop on
-                 * inode, make sure we keep processing request queue, till there
-                 * are no requests left.
+                /* If there is an error in wb_fulfill before winding write
+                 * requests, we would miss invocation of wb_process_queue
+                 * from wb_fulfill_cbk. So, retry processing again.
                  */
-                retry = wb_fulfill (wb_inode, &liabilities);
-        } while (retry);
+                wind_failure = wb_fulfill (wb_inode, &liabilities);
+        } while (wind_failure);
 
         return;
 }
@@ -1286,10 +1623,6 @@ wb_writev (call_frame_t *frame, xlator_t *this, fd_t *fd, struct iovec *vector,
 
 	conf = this->private;
 
-        if (wb_fd_err (fd, this, &op_errno)) {
-                goto unwind;
-        }
-
         wb_inode = wb_inode_create (this, fd->inode);
 	if (!wb_inode) {
 		op_errno = ENOMEM;
@@ -1310,7 +1643,7 @@ wb_writev (call_frame_t *frame, xlator_t *this, fd_t *fd, struct iovec *vector,
 					count, offset, flags, iobref, xdata);
 	else
 		stub = fop_writev_stub (frame, NULL, fd, vector, count, offset,
-					flags, iobref, xdata);
+                                        flags, iobref, xdata);
         if (!stub) {
                 op_errno = ENOMEM;
                 goto unwind;
@@ -1414,10 +1747,6 @@ wb_flush_helper (call_frame_t *frame, xlator_t *this, fd_t *fd, dict_t *xdata)
 		goto unwind;
 	}
 
-	if (wb_fd_err (fd, this, &op_errno)) {
-		op_ret = -1;
-		goto unwind;
-	}
 
         if (conf->flush_behind)
 		goto flushbehind;
@@ -1495,9 +1824,6 @@ wb_fsync (call_frame_t *frame, xlator_t *this, fd_t *fd, int32_t datasync,
         wb_inode_t   *wb_inode     = NULL;
         call_stub_t  *stub         = NULL;
 	int32_t       op_errno     = EINVAL;
-
-	if (wb_fd_err (fd, this, &op_errno))
-		goto unwind;
 
         wb_inode = wb_inode_ctx_get (this, fd->inode);
 	if (!wb_inode)
@@ -1720,9 +2046,6 @@ wb_ftruncate (call_frame_t *frame, xlator_t *this, fd_t *fd, off_t offset,
                 op_errno = ENOMEM;
 		goto unwind;
         }
-
-	if (wb_fd_err (fd, this, &op_errno))
-		goto unwind;
 
 	frame->local = wb_inode;
 
@@ -2004,7 +2327,18 @@ __wb_dump_requests (struct list_head *head, char *prefix)
 		else
 			gf_proc_dump_write ("wound", "no");
 
+                gf_proc_dump_write ("generation-number", "%d", req->gen);
+
+                gf_proc_dump_write ("req->op_ret", "%d", req->op_ret);
+                gf_proc_dump_write ("req->op_errno", "%d", req->op_errno);
+                gf_proc_dump_write ("sync-attempts", "%d", req->wind_count);
+
                 if (req->fop == GF_FOP_WRITE) {
+                        if (list_empty (&req->wip))
+                                gf_proc_dump_write ("sync-in-progress", "no");
+                        else
+                                gf_proc_dump_write ("sync-in-progress", "yes");
+
                         gf_proc_dump_write ("size", "%"GF_PRI_SIZET,
                                             req->write_size);
 
@@ -2022,6 +2356,7 @@ __wb_dump_requests (struct list_head *head, char *prefix)
 
                         flag = req->ordering.go;
                         gf_proc_dump_write ("go", "%d", flag);
+
                 }
         }
 }
@@ -2067,6 +2402,11 @@ wb_inode_dump (xlator_t *this, inode_t *inode)
                             wb_inode->window_current);
 
 
+        gf_proc_dump_write ("transit-size", "%"GF_PRI_SIZET,
+                            wb_inode->transit);
+
+        gf_proc_dump_write ("dontsync", "%d", wb_inode->dontsync);
+
         ret = TRY_LOCK (&wb_inode->lock);
         if (!ret)
         {
@@ -2099,7 +2439,9 @@ mem_acct_init (xlator_t *this)
         ret = xlator_mem_acct_init (this, gf_wb_mt_end + 1);
 
         if (ret != 0) {
-                gf_log (this->name, GF_LOG_ERROR, "Memory accounting init"
+                gf_msg (this->name, GF_LOG_ERROR, ENOMEM,
+                        WRITE_BEHIND_MSG_NO_MEMORY,
+                        "Memory accounting init"
                         "failed");
         }
 
@@ -2116,7 +2458,8 @@ reconfigure (xlator_t *this, dict_t *options)
 
         conf = this->private;
 
-        GF_OPTION_RECONF ("cache-size", conf->window_size, options, size_uint64, out);
+        GF_OPTION_RECONF ("cache-size", conf->window_size, options, size_uint64,
+                          out);
 
         GF_OPTION_RECONF ("flush-behind", conf->flush_behind, options, bool,
                           out);
@@ -2129,6 +2472,9 @@ reconfigure (xlator_t *this, dict_t *options)
 
         GF_OPTION_RECONF ("strict-write-ordering", conf->strict_write_ordering,
 			  options, bool, out);
+        GF_OPTION_RECONF ("resync-failed-syncs-after-fsync",
+                          conf->resync_after_fsync, options, bool, out);
+
         ret = 0;
 out:
         return ret;
@@ -2143,14 +2489,16 @@ init (xlator_t *this)
 
         if ((this->children == NULL)
             || this->children->next) {
-                gf_log (this->name, GF_LOG_ERROR,
+                gf_msg (this->name, GF_LOG_ERROR, 0,
+                        WRITE_BEHIND_MSG_INIT_FAILED,
                         "FATAL: write-behind (%s) not configured with exactly "
                         "one child", this->name);
                 goto out;
         }
 
         if (this->parents == NULL) {
-                gf_log (this->name, GF_LOG_WARNING,
+                gf_msg (this->name, GF_LOG_WARNING, 0,
+                        WRITE_BEHIND_MSG_VOL_MISCONFIGURED,
                         "dangling volume. check volfilex");
         }
 
@@ -2166,7 +2514,8 @@ init (xlator_t *this)
         GF_OPTION_INIT ("cache-size", conf->window_size, size_uint64, out);
 
         if (!conf->window_size && conf->aggregate_size) {
-                gf_log (this->name, GF_LOG_WARNING,
+                gf_msg (this->name, GF_LOG_WARNING, 0,
+                        WRITE_BEHIND_MSG_SIZE_NOT_SET,
                         "setting window-size to be equal to "
                         "aggregate-size(%"PRIu64")",
                         conf->aggregate_size);
@@ -2174,7 +2523,8 @@ init (xlator_t *this)
         }
 
         if (conf->window_size < conf->aggregate_size) {
-                gf_log (this->name, GF_LOG_ERROR,
+                gf_msg (this->name, GF_LOG_ERROR, 0,
+                        WRITE_BEHIND_MSG_EXCEEDED_MAX_SIZE,
                         "aggregate-size(%"PRIu64") cannot be more than "
                         "window-size(%"PRIu64")", conf->aggregate_size,
                         conf->window_size);
@@ -2190,6 +2540,9 @@ init (xlator_t *this)
 
         GF_OPTION_INIT ("strict-write-ordering", conf->strict_write_ordering,
 			bool, out);
+
+        GF_OPTION_INIT ("resync-failed-syncs-after-fsync",
+                        conf->resync_after_fsync, bool, out);
 
         this->private = conf;
         ret = 0;
@@ -2281,6 +2634,18 @@ struct volume_options options[] = {
           .default_value = "off",
 	  .description = "Do not let later writes overtake earlier writes even "
 	                  "if they do not overlap",
+        },
+        { .key = {"resync-failed-syncs-after-fsync"},
+          .type = GF_OPTION_TYPE_BOOL,
+          .default_value = "off",
+          .description = "If sync of \"cached-writes issued before fsync\" "
+                         "(to backend) fails, this option configures whether "
+                         "to retry syncing them after fsync or forget them. "
+                         "If set to on, cached-writes are retried "
+                         "till a \"flush\" fop (or a successful sync) on sync "
+                         "failures. "
+                         "fsync itself is failed irrespective of the value of "
+                         "this option. ",
         },
         { .key = {NULL} },
 };

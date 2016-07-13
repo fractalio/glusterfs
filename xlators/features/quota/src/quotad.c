@@ -11,6 +11,18 @@
 #include "quotad-aggregator.h"
 #include "common-utils.h"
 
+int
+qd_notify (xlator_t *this, int32_t event, void *data, ...)
+{
+        switch (event) {
+        case GF_EVENT_PARENT_UP:
+                quotad_aggregator_init (this);
+        }
+
+        default_notify (this, event, data);
+        return 0;
+}
+
 int32_t
 mem_acct_init (xlator_t *this)
 {
@@ -117,6 +129,14 @@ qd_nameless_lookup (xlator_t *this, call_frame_t *frame, gfs3_lookup_req *req,
                 goto out;
         }
 
+        ret = dict_set_int8 (xdata, QUOTA_READ_ONLY_KEY, 1);
+        if (ret < 0) {
+                gf_msg (this->name, GF_LOG_WARNING, ENOMEM,
+                        Q_MSG_ENOMEM, "dict set failed");
+                ret = -ENOMEM;
+                goto out;
+        }
+
         subvol = qd_find_subvol (this, volume_uuid);
         if (subvol == NULL) {
                 op_errno = EINVAL;
@@ -147,6 +167,21 @@ qd_reconfigure (xlator_t *this, dict_t *options)
 void
 qd_fini (xlator_t *this)
 {
+        quota_priv_t    *priv           = NULL;
+
+        if (this == NULL || this->private == NULL)
+                goto out;
+
+        priv = this->private;
+
+        if (priv->rpcsvc) {
+                GF_FREE (priv->rpcsvc);
+                priv->rpcsvc = NULL;
+        }
+
+        GF_FREE (priv);
+
+out:
         return;
 }
 
@@ -169,10 +204,6 @@ qd_init (xlator_t *this)
 
         this->private = priv;
 
-        ret = quotad_aggregator_init (this);
-        if (ret < 0)
-                goto err;
-
         ret = 0;
 err:
         if (ret) {
@@ -185,6 +216,7 @@ class_methods_t class_methods = {
         .init           = qd_init,
         .fini           = qd_fini,
         .reconfigure    = qd_reconfigure,
+        .notify         = qd_notify
 };
 
 struct xlator_fops fops = {

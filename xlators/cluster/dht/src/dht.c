@@ -9,11 +9,6 @@
 */
 
 
-#ifndef _CONFIG_H
-#define _CONFIG_H
-#include "config.h"
-#endif
-
 #include "statedump.h"
 #include "dht-common.h"
 
@@ -57,6 +52,7 @@ struct xlator_fops fops = {
         .inodelk     = dht_inodelk,
         .finodelk    = dht_finodelk,
         .lk          = dht_lk,
+        .lease       = dht_lease,
 
         /* Inode write operations */
         .fremovexattr = dht_fremovexattr,
@@ -82,8 +78,7 @@ struct xlator_dumpops dumpops = {
 
 
 struct xlator_cbks cbks = {
-//      .release    = dht_release,
+        .release    = dht_release,
 //      .releasedir = dht_releasedir,
         .forget     = dht_forget
 };
-;

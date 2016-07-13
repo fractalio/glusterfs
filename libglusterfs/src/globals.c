@@ -8,11 +8,6 @@
   cases as published by the Free Software Foundation.
 */
 
-#ifndef _CONFIG_H
-#define _CONFIG_H
-#include "config.h"
-#endif /* !_CONFIG_H */
-
 #include <pthread.h>
 
 #include "glusterfs.h"
@@ -20,6 +15,7 @@
 #include "xlator.h"
 #include "mem-pool.h"
 #include "syncop.h"
+#include "libglusterfs-messages.h"
 
 const char *gf_fop_list[GF_FOP_MAXVALUE] = {
         [GF_FOP_NULL]        = "NULL",
@@ -70,10 +66,21 @@ const char *gf_fop_list[GF_FOP_MAXVALUE] = {
         [GF_FOP_FREMOVEXATTR]= "FREMOVEXATTR",
 	[GF_FOP_FALLOCATE]   = "FALLOCATE",
 	[GF_FOP_DISCARD]     = "DISCARD",
-        [GF_FOP_ZEROFILL]     = "ZEROFILL",
+        [GF_FOP_ZEROFILL]    = "ZEROFILL",
+        [GF_FOP_IPC]         = "IPC",
+        [GF_FOP_SEEK]        = "SEEK",
+        [GF_FOP_LEASE]       = "LEASE",
+        [GF_FOP_COMPOUND]    = "COMPOUND",
+        [GF_FOP_GETACTIVELK] = "GETACTIVELK",
+        [GF_FOP_SETACTIVELK] = "SETACTIVELK",
 };
 /* THIS */
 
+/* This global ctx is a bad hack to prevent some of the libgfapi crashes.
+ * This should be removed once the patch on resource pool is accepted
+ */
+glusterfs_ctx_t *global_ctx = NULL;
+pthread_mutex_t global_ctx_mutex = PTHREAD_MUTEX_INITIALIZER;
 xlator_t global_xlator;
 static pthread_key_t this_xlator_key;
 static pthread_key_t synctask_key;
@@ -81,7 +88,23 @@ static pthread_key_t uuid_buf_key;
 static char          global_uuid_buf[GF_UUID_BUF_SIZE];
 static pthread_key_t lkowner_buf_key;
 static char          global_lkowner_buf[GF_LKOWNER_BUF_SIZE];
+static pthread_key_t leaseid_buf_key;
+static int gf_global_mem_acct_enable = 1;
+static pthread_once_t globals_inited = PTHREAD_ONCE_INIT;
 
+
+int
+gf_global_mem_acct_enable_get (void)
+{
+	return gf_global_mem_acct_enable;
+}
+
+int
+gf_global_mem_acct_enable_set (int val)
+{
+	gf_global_mem_acct_enable = val;
+	return 0;
+}
 
 void
 glusterfs_this_destroy (void *ptr)
@@ -97,7 +120,9 @@ glusterfs_this_init ()
 
         ret = pthread_key_create (&this_xlator_key, glusterfs_this_destroy);
         if (ret != 0) {
-                gf_log ("", GF_LOG_WARNING, "failed to create the pthread key");
+                gf_msg ("", GF_LOG_WARNING, ret,
+                        LG_MSG_PTHREAD_KEY_CREATE_FAILED, "failed to create "
+                        "the pthread key");
                 return ret;
         }
 
@@ -315,47 +340,108 @@ glusterfs_lkowner_buf_get ()
         return buf;
 }
 
+/* Leaseid buffer */
+void
+glusterfs_leaseid_buf_destroy (void *ptr)
+{
+        FREE (ptr);
+}
+
 int
-glusterfs_globals_init (glusterfs_ctx_t *ctx)
+glusterfs_leaseid_buf_init ()
 {
         int ret = 0;
 
-        gf_log_globals_init (ctx);
+        ret = pthread_key_create (&leaseid_buf_key,
+                                  glusterfs_leaseid_buf_destroy);
+        return ret;
+}
+
+char *
+glusterfs_leaseid_buf_get ()
+{
+        char *buf = NULL;
+        int   ret = 0;
+
+        buf = pthread_getspecific (leaseid_buf_key);
+        if (!buf) {
+                buf = CALLOC (1, GF_LEASE_ID_BUF_SIZE);
+                ret = pthread_setspecific (leaseid_buf_key, (void *) buf);
+                if (ret) {
+                        FREE (buf);
+                        buf = NULL;
+                }
+        }
+        return buf;
+}
+
+static void
+gf_globals_init_once ()
+{
+        int ret = 0;
 
         ret = glusterfs_this_init ();
         if (ret) {
-                gf_log ("", GF_LOG_CRITICAL,
+                gf_msg ("", GF_LOG_CRITICAL, 0, LG_MSG_TRANSLATOR_INIT_FAILED,
                         "ERROR: glusterfs-translator init failed");
                 goto out;
         }
 
         ret = glusterfs_uuid_buf_init ();
         if(ret) {
-                gf_log ("", GF_LOG_CRITICAL,
+                gf_msg ("", GF_LOG_CRITICAL, 0, LG_MSG_UUID_BUF_INIT_FAILED,
                         "ERROR: glusterfs uuid buffer init failed");
                 goto out;
         }
 
         ret = glusterfs_lkowner_buf_init ();
         if(ret) {
-                gf_log ("", GF_LOG_CRITICAL,
+                gf_msg ("", GF_LOG_CRITICAL, 0, LG_MSG_LKOWNER_BUF_INIT_FAILED,
                         "ERROR: glusterfs lkowner buffer init failed");
+                goto out;
+        }
+
+        ret = glusterfs_leaseid_buf_init ();
+        if (ret) {
+                gf_msg ("", GF_LOG_CRITICAL, 0, LG_MSG_LEASEID_BUF_INIT_FAILED,
+                        "ERROR: glusterfs leaseid buffer init failed");
                 goto out;
         }
 
         ret = synctask_init ();
         if (ret) {
-                gf_log ("", GF_LOG_CRITICAL,
+                gf_msg ("", GF_LOG_CRITICAL, 0, LG_MSG_SYNCTASK_INIT_FAILED,
                         "ERROR: glusterfs synctask init failed");
                 goto out;
         }
 
         ret = syncopctx_init ();
         if (ret) {
-                gf_log ("", GF_LOG_CRITICAL,
+                gf_msg ("", GF_LOG_CRITICAL, 0, LG_MSG_SYNCOPCTX_INIT_FAILED,
                         "ERROR: glusterfs syncopctx init failed");
                 goto out;
         }
 out:
+
+        if (ret) {
+                gf_msg ("", GF_LOG_CRITICAL, 0, LG_MSG_GLOBAL_INIT_FAILED,
+                        "Exiting as global initialization failed");
+                exit (ret);
+        }
+}
+
+int
+glusterfs_globals_init (glusterfs_ctx_t *ctx)
+{
+        int ret = 0;
+
+        gf_log_globals_init (ctx, GF_LOG_INFO);
+
+        ret =  pthread_once (&globals_inited, gf_globals_init_once);
+
+        if (ret)
+                gf_msg ("", GF_LOG_CRITICAL, ret, LG_MSG_PTHREAD_FAILED,
+                        "pthread_once failed");
+
         return ret;
 }

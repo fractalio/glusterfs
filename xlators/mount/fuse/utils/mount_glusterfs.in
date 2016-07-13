@@ -1,5 +1,6 @@
 #!/bin/sh
 # (C) 2014 Red Hat Inc. <http://www.redhat.com>
+# (C) 2015 ungleich GmbH <http://www.ungleich.ch>
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License as
@@ -19,7 +20,7 @@
 
 warn ()
 {
-   echo "$@" >/dev/stderr
+   echo "$@" >&2
 }
 
 _init ()
@@ -172,6 +173,10 @@ start_glusterfs ()
         cmd_line=$(echo "$cmd_line --no-root-squash");
     fi
 
+    if [ -n "$capability" ]; then
+         cmd_line=$(echo "$cmd_line --capability");
+    fi
+
 #options with values start here
     if [ -n "$log_level" ]; then
         cmd_line=$(echo "$cmd_line --log-level=$log_level");
@@ -301,7 +306,7 @@ start_glusterfs ()
 
 print_usage ()
 {
-cat << EOF >/dev/stderr
+cat << EOF >&2
 Usage: $0 <volumeserver>:<volumeid/volumeport> -o<options> <mountpoint>
 Options:
 man 8 $0
@@ -439,6 +444,9 @@ without_options()
             ;;
         "_netdev")
             ;;
+        "capability")
+            capability=1
+            ;;
         *)
             warn "Invalid option $option";
             exit 1
@@ -493,7 +501,8 @@ main ()
     done
 
     [ -r "$volfile_loc" ] || {
-        server_ip=$(echo "$volfile_loc" | sed -n 's/\([a-zA-Z0-9:.\-]*\):.*/\1/p');
+        # '%' included to support ipv6 link local addresses
+        server_ip=$(echo "$volfile_loc" | sed -n 's/\([a-zA-Z0-9:%.\-]*\):.*/\1/p');
         volume_str=$(echo "$volfile_loc" | sed -n 's/.*:\([^ ]*\).*/\1/p');
         [ -n "$volume_str" ] && {
             volume_id="$volume_str";
@@ -502,7 +511,7 @@ main ()
     }
 
     [ -z "$volume_id" -o -z "$server_ip" ] && {
-        cat <<EOF >/dev/stderr
+        cat <<EOF >&2
 ERROR: Server name/volume name unspecified cannot proceed further..
 Please specify correct format
 Usage:
@@ -513,7 +522,7 @@ EOF
 
     grep_ret=$(echo ${mount_point} | grep '^\-o');
     [ "x" != "x${grep_ret}" ] && {
-        cat <<EOF >/dev/stderr
+        cat <<EOF >&2
 ERROR: -o options cannot be specified in either first two arguments..
 Please specify correct style
 Usage:
@@ -525,7 +534,7 @@ EOF
     # No need to do a ! -d test, it is taken care while initializing the
     # variable mount_point
     [ -z "$mount_point" -o ! -d "$mount_point" ] && {
-        cat <<EOF >/dev/stderr
+        cat <<EOF >&2
 ERROR: Mount point does not exist
 Please specify a mount point
 Usage:

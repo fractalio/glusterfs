@@ -1,5 +1,6 @@
 #!/bin/bash
 
+. $(dirname $0)/../../traps.rc
 . $(dirname $0)/../../include.rc
 . $(dirname $0)/../../volume.rc
 
@@ -11,7 +12,7 @@ function my_getfattr {
 }
 
 function get_rep_count {
-    v=$(my_getfattr -n trusted.nsr.rep-count $1)
+    v=$(my_getfattr -n trusted.jbr.rep-count $1)
     #echo $v > /dev/tty
     echo $v
 }
@@ -155,7 +156,7 @@ function check_perm_file {
 cleanup
 
 TEST useradd -o -M -u ${TEST_UID} ${TEST_USER}
-trap "userdel --force ${TEST_USER}" EXIT
+push_trapfunc "userdel --force ${TEST_USER}"
 
 TEST glusterd
 TEST pidof glusterd
@@ -177,7 +178,7 @@ EXPECT_WITHIN $CHILD_UP_TIMEOUT "10" ec_child_up_count $V0 0
 
 # Create local files for comparisons etc.
 tmpdir=$(mktemp -d -t ${0##*/}.XXXXXX)
-trap "rm -rf $tmpdir" EXIT
+push_trapfunc "rm -rf $tmpdir"
 TEST create_file $tmpdir/create-write 10
 TEST create_file $tmpdir/truncate 10
 
@@ -221,13 +222,13 @@ TEST setup_perm_file $M0
 sleep 2
 
 # Unmount/remount so that create/write and truncate don't see cached data.
-TEST umount $M0
-TEST $GFS -s $H0 --volfile-id $V0 $M0
+EXPECT_WITHIN $UMOUNT_TIMEOUT "Y" force_umount $M0
+TEST $GFS -s $H0 --volfile-id $V0 $M1
 EXPECT_WITHIN $CHILD_UP_TIMEOUT "8" ec_child_up_count $V0 0
 
 # Test create/write and truncate *before* the bricks are brought back.
-TEST check_create_write $M0
-TEST check_truncate $M0
+TEST check_create_write $M1
+TEST check_truncate $M1
 
 # Restart the bricks and allow repair to occur.
 TEST $CLI volume start $V0 force
@@ -235,7 +236,7 @@ EXPECT_WITHIN $PROCESS_UP_TIMEOUT 'Started' volinfo_field $V0 'Status'
 EXPECT_WITHIN $CHILD_UP_TIMEOUT "10" ec_child_up_count $V0 0
 
 # Unmount/remount again, same reason as before.
-TEST umount $M0
+EXPECT_WITHIN $UMOUNT_TIMEOUT "Y" force_umount $M1
 TEST $GFS -s $H0 --volfile-id $V0 $M0
 EXPECT_WITHIN $CHILD_UP_TIMEOUT "10" ec_child_up_count $V0 0
 
@@ -254,8 +255,5 @@ EXPECT_WITHIN $HEAL_TIMEOUT "Y" check_mkdir $B0/${V0}{0..9}
 EXPECT_WITHIN $HEAL_TIMEOUT "Y" check_setxattr $B0/${V0}{0..9}
 EXPECT_WITHIN $HEAL_TIMEOUT "Y" check_removexattr $B0/${V0}{0..9}
 EXPECT_WITHIN $HEAL_TIMEOUT "Y" check_perm_file $B0/${V0}{0..9}
-
-TEST rm -rf $tmpdir
-TEST userdel --force ${TEST_USER}
 
 cleanup

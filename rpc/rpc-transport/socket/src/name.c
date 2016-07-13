@@ -23,40 +23,47 @@
 #include "socket.h"
 #include "common-utils.h"
 
+static void
+_assign_port (struct sockaddr *sockaddr, uint16_t port)
+{
+        switch (sockaddr->sa_family) {
+        case AF_INET6:
+                ((struct sockaddr_in6 *)sockaddr)->sin6_port = htons (port);
+                break;
+
+        case AF_INET_SDP:
+        case AF_INET:
+                ((struct sockaddr_in *)sockaddr)->sin_port = htons (port);
+                break;
+        }
+}
+
 static int32_t
 af_inet_bind_to_port_lt_ceiling (int fd, struct sockaddr *sockaddr,
-                                 socklen_t sockaddr_len, int ceiling)
+                                 socklen_t sockaddr_len, uint32_t ceiling)
 {
         int32_t        ret        = -1;
         uint16_t      port        = ceiling - 1;
-        // by default assume none of the ports are blocked and all are available
-        gf_boolean_t  ports[1024] = {_gf_false,};
+        gf_boolean_t  ports[GF_PORT_MAX];
         int           i           = 0;
 
-        ret = gf_process_reserved_ports (ports);
-        if (ret != 0) {
-                for (i = 0; i < 1024; i++)
-                        ports[i] = _gf_false;
-        }
+loop:
+        ret = gf_process_reserved_ports (ports, ceiling);
 
-        while (port)
-        {
-                switch (sockaddr->sa_family)
-                {
-                case AF_INET6:
-                        ((struct sockaddr_in6 *)sockaddr)->sin6_port = htons (port);
-                        break;
-
-                case AF_INET_SDP:
-                case AF_INET:
-                        ((struct sockaddr_in *)sockaddr)->sin_port = htons (port);
+        while (port) {
+                if (port == GF_CLIENT_PORT_CEILING) {
+                        ret = -1;
                         break;
                 }
-                // ignore the reserved ports
+
+                /* ignore the reserved ports */
                 if (ports[port] == _gf_true) {
                         port--;
                         continue;
                 }
+
+                _assign_port (sockaddr, port);
+
                 ret = bind (fd, sockaddr, sockaddr_len);
 
                 if (ret == 0)
@@ -66,6 +73,18 @@ af_inet_bind_to_port_lt_ceiling (int fd, struct sockaddr *sockaddr,
                         break;
 
                 port--;
+        }
+
+        /* Incase if all the secure ports are exhausted, we are no more
+         * binding to secure ports, hence instead of getting a random
+         * port, lets define the range to restrict it from getting from
+         * ports reserved for bricks i.e from range of 49152 - 65535
+         * which further may lead to port clash */
+        if (!port) {
+                ceiling = port = GF_CLNT_INSECURE_PORT_CEILING;
+                for (i = 0; i <= ceiling; i++)
+                        ports[i] = _gf_false;
+                goto loop;
         }
 
         return ret;
@@ -144,9 +163,10 @@ client_fill_address_family (rpc_transport_t *this, sa_family_t *sa_family)
 
                 if (remote_host_data) {
                         gf_log (this->name, GF_LOG_DEBUG,
-                                "address-family not specified, guessing it "
-                                "to be inet from (remote-host: %s)", data_to_str (remote_host_data));
-                        *sa_family = AF_INET;
+                                "address-family not specified, marking it as unspec "
+                                "for getaddrinfo to resolve from (remote-host: %s)",
+                                data_to_str(remote_host_data));
+                        *sa_family = AF_UNSPEC;
                 } else {
                         gf_log (this->name, GF_LOG_DEBUG,
                                 "address-family not specified, guessing it "
@@ -390,7 +410,7 @@ af_inet_server_get_local_sockaddr (rpc_transport_t *this,
         memset (&hints, 0, sizeof (hints));
         hints.ai_family = addr->sa_family;
         hints.ai_socktype = SOCK_STREAM;
-        hints.ai_flags    = AI_PASSIVE | AI_ADDRCONFIG;
+        hints.ai_flags    = AI_PASSIVE;
 
         ret = getaddrinfo(listen_host, service, &hints, &res);
         if (ret != 0) {
@@ -439,13 +459,27 @@ client_bind (rpc_transport_t *this,
         case AF_INET6:
                 if (!this->bind_insecure) {
                         ret = af_inet_bind_to_port_lt_ceiling (sock, sockaddr,
-                                                       *sockaddr_len, GF_CLIENT_PORT_CEILING);
-                }
-                if (ret == -1) {
-                        gf_log (this->name, GF_LOG_DEBUG,
-                                "cannot bind inet socket (%d) to port less than %d (%s)",
-                                sock, GF_CLIENT_PORT_CEILING, strerror (errno));
-                        ret = 0;
+                                                               *sockaddr_len,
+                                                               GF_CLIENT_PORT_CEILING);
+                        if (ret == -1) {
+                                gf_log (this->name, GF_LOG_DEBUG,
+                                        "cannot bind inet socket (%d) "
+                                        "to port less than %d (%s)",
+                                        sock, GF_CLIENT_PORT_CEILING,
+                                        strerror (errno));
+                                ret = 0;
+                        }
+                } else {
+                        ret = af_inet_bind_to_port_lt_ceiling (sock, sockaddr,
+                                                               *sockaddr_len,
+                                                               GF_IANA_PRIV_PORTS_START);
+                        if (ret == -1) {
+                                gf_log (this->name, GF_LOG_DEBUG,
+                                        "failed while binding to less than "
+                                        "%d (%s)", GF_IANA_PRIV_PORTS_START,
+                                        strerror (errno));
+                                ret = 0;
+                        }
                 }
                 break;
 

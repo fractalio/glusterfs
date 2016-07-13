@@ -27,12 +27,20 @@ from ipaddr import IPAddress, IPNetwork
 
 from gconf import gconf
 from syncdutils import FreeObject, norm, grabpidfile, finalize
-from syncdutils import log_raise_exception, privileged, update_file
+from syncdutils import log_raise_exception, privileged, boolify
 from syncdutils import GsyncdError, select, set_term_handler
-from configinterface import GConffile, upgrade_config_file
+from configinterface import GConffile, upgrade_config_file, TMPL_CONFIG_FILE
 import resource
 from monitor import monitor
+import xml.etree.ElementTree as XET
+from subprocess import PIPE
+import subprocess
 from changelogagent import agent, Changelog
+from gsyncdstatus import set_monitor_status, GeorepStatus
+from libcxattr import Xattr
+import struct
+
+ParseError = XET.ParseError if hasattr(XET, 'ParseError') else SyntaxError
 
 
 class GLogger(Logger):
@@ -72,6 +80,7 @@ class GLogger(Logger):
         logging.setLoggerClass(cls)
         logging.getLogger().handlers = []
         logging.getLogger().setLevel(lprm['level'])
+        logging.Formatter.converter = time.gmtime  # Log in GMT/UTC time
 
         if 'filename' in lprm:
             try:
@@ -108,6 +117,36 @@ class GLogger(Logger):
         lkw.update({'saved_label': kw.get('label')})
         gconf.log_metadata = lkw
         gconf.log_exit = True
+
+
+# Given slave host and its volume name, get corresponding volume uuid
+def slave_vol_uuid_get(host, vol):
+    po = subprocess.Popen(['gluster', '--xml', '--remote-host=' + host,
+                           'volume', 'info', vol], bufsize=0,
+                          stdin=None, stdout=PIPE, stderr=PIPE)
+    vix, err = po.communicate()
+    if po.returncode != 0:
+        logging.info("Volume info failed, unable to get "
+                     "volume uuid of %s present in %s,"
+                     "returning empty string: %s" %
+                     (vol, host, po.returncode))
+        return ""
+    vi = XET.fromstring(vix)
+    if vi.find('opRet').text != '0':
+        logging.info("Unable to get volume uuid of %s, "
+                     "present in %s returning empty string: %s" %
+                     (vol, host, vi.find('opErrstr').text))
+        return ""
+
+    try:
+        voluuid = vi.find("volInfo/volumes/volume/id").text
+    except (ParseError, AttributeError, ValueError) as e:
+        logging.info("Parsing failed to volume uuid of %s, "
+                     "present in %s returning empty string: %s" %
+                     (vol, host, e))
+        voluuid = ""
+
+    return voluuid
 
 
 def startup(**kw):
@@ -216,9 +255,9 @@ def main_i():
                   action='callback', callback=store_abs)
     op.add_option('-l', '--log-file', metavar='LOGF', type=str,
                   action='callback', callback=store_abs)
-    op.add_option('--iprefix',  metavar='LOGD',  type=str,
+    op.add_option('--iprefix', metavar='LOGD', type=str,
                   action='callback', callback=store_abs)
-    op.add_option('--changelog-log-file',  metavar='LOGF',  type=str,
+    op.add_option('--changelog-log-file', metavar='LOGF', type=str,
                   action='callback', callback=store_abs)
     op.add_option('--log-file-mbr', metavar='LOGF', type=str,
                   action='callback', callback=store_abs)
@@ -231,6 +270,10 @@ def main_i():
     op.add_option('--ignore-deletes', default=False, action='store_true')
     op.add_option('--isolated-slave', default=False, action='store_true')
     op.add_option('--use-rsync-xattrs', default=False, action='store_true')
+    op.add_option('--sync-xattrs', default=True, action='store_true')
+    op.add_option('--sync-acls', default=True, action='store_true')
+    op.add_option('--log-rsync-performance', default=False,
+                  action='store_true')
     op.add_option('--pause-on-start', default=False, action='store_true')
     op.add_option('-L', '--log-level', metavar='LVL')
     op.add_option('-r', '--remote-gsyncd', metavar='CMD',
@@ -242,6 +285,7 @@ def main_i():
     op.add_option(
         '--local-path', metavar='PATH', help=SUPPRESS_HELP, default='')
     op.add_option('-s', '--ssh-command', metavar='CMD', default='ssh')
+    op.add_option('--ssh-port', metavar='PORT', type=int, default=22)
     op.add_option('--ssh-command-tar', metavar='CMD', default='ssh')
     op.add_option('--rsync-command', metavar='CMD', default='rsync')
     op.add_option('--rsync-options', metavar='OPTS', default='')
@@ -252,13 +296,18 @@ def main_i():
     op.add_option('--sync-jobs', metavar='N', type=int, default=3)
     op.add_option('--replica-failover-interval', metavar='N',
                   type=int, default=1)
+    op.add_option('--changelog-archive-format', metavar='N',
+                  type=str, default="%Y%m")
+    op.add_option('--use-meta-volume', default=False, action='store_true')
+    op.add_option('--meta-volume-mnt', metavar='N',
+                  type=str, default="/var/run/gluster/shared_storage")
     op.add_option(
         '--turns', metavar='N', type=int, default=0, help=SUPPRESS_HELP)
     op.add_option('--allow-network', metavar='IPS', default='')
     op.add_option('--socketdir', metavar='DIR')
     op.add_option('--state-socket-unencoded', metavar='SOCKF',
                   type=str, action='callback', callback=store_abs)
-    op.add_option('--checkpoint', metavar='LABEL', default='')
+    op.add_option('--checkpoint', metavar='LABEL', default='0')
 
     # tunables for failover/failback mechanism:
     # None   - gsyncd behaves as normal
@@ -294,15 +343,24 @@ def main_i():
     op.add_option('--feedback-fd', dest='feedback_fd', type=int,
                   help=SUPPRESS_HELP, action='callback', callback=store_local)
     op.add_option('--rpc-fd', dest='rpc_fd', type=str, help=SUPPRESS_HELP)
+    op.add_option('--subvol-num', dest='subvol_num', type=str,
+                  help=SUPPRESS_HELP)
     op.add_option('--listen', dest='listen', help=SUPPRESS_HELP,
                   action='callback', callback=store_local_curry(True))
     op.add_option('-N', '--no-daemon', dest="go_daemon",
                   action='callback', callback=store_local_curry('dont'))
     op.add_option('--verify', type=str, dest="verify",
                   action='callback', callback=store_local)
+    op.add_option('--slavevoluuid-get', type=str, dest="slavevoluuid_get",
+                  action='callback', callback=store_local)
     op.add_option('--create', type=str, dest="create",
                   action='callback', callback=store_local)
     op.add_option('--delete', dest='delete', action='callback',
+                  callback=store_local_curry(True))
+    op.add_option('--path-list', dest='path_list', action='callback',
+                  type=str, callback=store_local)
+    op.add_option('--reset-sync-time', default=False, action='store_true')
+    op.add_option('--status-get', dest='status_get', action='callback',
                   callback=store_local_curry(True))
     op.add_option('--debug', dest="go_daemon", action='callback',
                   callback=lambda *a: (store_local_curry('dont')(*a),
@@ -342,6 +400,7 @@ def main_i():
                   action='callback', callback=store_local_curry('canon'))
     op.add_option('--canonicalize-escape-url', dest='url_print',
                   action='callback', callback=store_local_curry('canon_esc'))
+    op.add_option('--is-hottier', default=False, action='store_true')
 
     tunables = [norm(o.get_opt_string()[2:])
                 for o in op.option_list
@@ -357,7 +416,27 @@ def main_i():
     # the parser with virgin values container.
     defaults = op.get_default_values()
     opts, args = op.parse_args(values=optparse.Values())
+    # slave url cleanup, if input comes with vol uuid as follows
+    # 'ssh://fvm1::gv2:07dfddca-94bb-4841-a051-a7e582811467'
+    temp_args = []
+    for arg in args:
+        # Split based on ::
+        data = arg.split("::")
+        if len(data)>1:
+            slavevol_name = data[1].split(":")[0]
+            temp_args.append("%s::%s" % (data[0], slavevol_name))
+        else:
+            temp_args.append(data[0])
+    args = temp_args
     args_orig = args[:]
+
+    voluuid_get = rconf.get('slavevoluuid_get')
+    if voluuid_get:
+        slave_host, slave_vol = voluuid_get.split("::")
+        svol_uuid = slave_vol_uuid_get(slave_host, slave_vol)
+        print svol_uuid
+        return
+
     r = rconf.get('resource_local')
     if r:
         if len(args) == 0:
@@ -457,12 +536,11 @@ def main_i():
                 if name == 'remote':
                     namedict['remotehost'] = x.remotehost
     if not 'config_file' in rconf:
-        rconf['config_file'] = os.path.join(
-            os.path.dirname(sys.argv[0]), "conf/gsyncd_template.conf")
+        rconf['config_file'] = TMPL_CONFIG_FILE
 
-    upgrade_config_file(rconf['config_file'])
+    upgrade_config_file(rconf['config_file'], confdata)
     gcnf = GConffile(
-        rconf['config_file'], canon_peers,
+        rconf['config_file'], canon_peers, confdata,
         defaults.__dict__, opts.__dict__, namedict)
 
     checkpoint_change = False
@@ -498,6 +576,10 @@ def main_i():
     delete = rconf.get('delete')
     if delete:
         logging.info('geo-replication delete')
+        # remove the stime xattr from all the brick paths so that
+        # a re-create of a session will start sync all over again
+        stime_xattr_name = getattr(gconf, 'master.stime_xattr_name', None)
+
         # Delete pid file, status file, socket file
         cleanup_paths = []
         if getattr(gconf, 'pid_file', None):
@@ -530,6 +612,20 @@ def main_i():
             # To delete temp files
             for f in glob.glob(path + "*"):
                 _unlink(f)
+
+        reset_sync_time = boolify(gconf.reset_sync_time)
+        if reset_sync_time and stime_xattr_name:
+            path_list = rconf.get('path_list')
+            paths = []
+            for p in path_list.split('--path='):
+                stripped_path = p.strip()
+                if stripped_path != "":
+                    # set stime to (0,0) to trigger full volume content resync
+                    # to slave on session recreation
+                    # look at master.py::Xcrawl   hint: zero_zero
+                    Xattr.lsetxattr(stripped_path, stime_xattr_name,
+                                    struct.pack("!II", 0, 0))
+
         return
 
     if restricted and gconf.allow_network:
@@ -572,15 +668,8 @@ def main_i():
             GLogger._gsyncd_loginit(log_file=gconf.log_file, label='conf')
             if confdata.op == 'set':
                 logging.info('checkpoint %s set' % confdata.val)
-                gcnf.delete('checkpoint_completed')
-                gcnf.delete('checkpoint_target')
             elif confdata.op == 'del':
                 logging.info('checkpoint info was reset')
-                # if it is removing 'checkpoint' then we need
-                # to remove 'checkpoint_completed' and 'checkpoint_target' too
-                gcnf.delete('checkpoint_completed')
-                gcnf.delete('checkpoint_target')
-
         except IOError:
             if sys.exc_info()[1].errno == ENOENT:
                 # directory of log path is not present,
@@ -596,7 +685,7 @@ def main_i():
     create = rconf.get('create')
     if create:
         if getattr(gconf, 'state_file', None):
-            update_file(gconf.state_file, lambda f: f.write(create + '\n'))
+            set_monitor_status(gconf.state_file, create)
         return
 
     go_daemon = rconf['go_daemon']
@@ -604,6 +693,16 @@ def main_i():
     be_agent = rconf.get('agent')
 
     rscs, local, remote = makersc(args)
+
+    status_get = rconf.get('status_get')
+    if status_get:
+        for brick in gconf.path:
+            brick_status = GeorepStatus(gconf.state_file, brick,
+                                        getattr(gconf, "pid_file", None))
+            checkpoint_time = int(getattr(gconf, "checkpoint", "0"))
+            brick_status.print_status(checkpoint_time=checkpoint_time)
+        return
+
     if not be_monitor and isinstance(remote, resource.SSH) and \
        go_daemon == 'should':
         go_daemon = 'postconn'

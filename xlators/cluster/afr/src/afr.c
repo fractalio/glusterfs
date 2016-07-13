@@ -15,13 +15,19 @@
 #include <stdlib.h>
 #include <signal.h>
 
-#ifndef _CONFIG_H
-#define _CONFIG_H
-#include "config.h"
-#endif
 #include "afr-common.c"
+#include "afr-messages.h"
 
 struct volume_options options[];
+
+static char *afr_favorite_child_policies[AFR_FAV_CHILD_POLICY_MAX + 1] = {
+        [AFR_FAV_CHILD_NONE] = "none",
+        [AFR_FAV_CHILD_BY_SIZE] = "size",
+        [AFR_FAV_CHILD_BY_CTIME] = "ctime",
+        [AFR_FAV_CHILD_BY_MTIME] = "mtime",
+        [AFR_FAV_CHILD_BY_MAJORITY] = "majority",
+        [AFR_FAV_CHILD_POLICY_MAX] = NULL,
+};
 
 int32_t
 notify (xlator_t *this, int32_t event,
@@ -50,8 +56,6 @@ mem_acct_init (xlator_t *this)
         ret = xlator_mem_acct_init (this, gf_afr_mt_end + 1);
 
         if (ret != 0) {
-                gf_log(this->name, GF_LOG_ERROR, "Memory accounting init"
-                       "failed");
                 return ret;
         }
 
@@ -81,22 +85,43 @@ xlator_subvolume_index (xlator_t *this, xlator_t *subvol)
         return index;
 }
 
-void
-fix_quorum_options (xlator_t *this, afr_private_t *priv, char *qtype)
+static void
+fix_quorum_options (xlator_t *this, afr_private_t *priv, char *qtype,
+                    dict_t *options)
 {
-        if (priv->quorum_count && strcmp(qtype,"fixed")) {
+        if (dict_get (options, "quorum-type") == NULL) {
+                /* If user doesn't configure anything enable auto-quorum if the
+                 * replica has odd number of subvolumes */
+                if (priv->child_count % 2)
+                        qtype = "auto";
+        }
+
+        if (priv->quorum_count && strcmp (qtype, "fixed")) {
                 gf_msg (this->name,GF_LOG_WARNING, 0, AFR_MSG_QUORUM_OVERRIDE,
                        "quorum-type %s overriding quorum-count %u",
                        qtype, priv->quorum_count);
         }
-        if (!strcmp(qtype,"none")) {
+
+        if (!strcmp (qtype, "none")) {
                 priv->quorum_count = 0;
-        }
-        else if (!strcmp(qtype,"auto")) {
+        } else if (!strcmp (qtype, "auto")) {
                 priv->quorum_count = AFR_QUORUM_AUTO;
         }
 }
 
+int
+afr_set_favorite_child_policy (afr_private_t *priv, char *policy)
+{
+        int index = -1;
+
+        index = gf_get_index_by_elem (afr_favorite_child_policies, policy);
+        if (index  < 0 || index >= AFR_FAV_CHILD_POLICY_MAX)
+                return -1;
+
+        priv->fav_child_policy = index;
+
+        return 0;
+}
 int
 reconfigure (xlator_t *this, dict_t *options)
 {
@@ -106,6 +131,7 @@ reconfigure (xlator_t *this, dict_t *options)
         int            ret         = -1;
         int            index       = -1;
         char          *qtype       = NULL;
+        char          *fav_child_policy = NULL;
 
         priv = this->private;
 
@@ -120,6 +146,10 @@ reconfigure (xlator_t *this, dict_t *options)
         GF_OPTION_RECONF ("background-self-heal-count",
                           priv->background_self_heal_count, options, uint32,
                           out);
+
+        GF_OPTION_RECONF ("heal-wait-queue-length",
+                          priv->heal_wait_qlen, options, uint32, out);
+
 
         GF_OPTION_RECONF ("metadata-self-heal",
                           priv->metadata_self_heal, options, bool, out);
@@ -154,7 +184,8 @@ reconfigure (xlator_t *this, dict_t *options)
         if (read_subvol) {
                 index = xlator_subvolume_index (this, read_subvol);
                 if (index == -1) {
-                        gf_log (this->name, GF_LOG_ERROR, "%s not a subvolume",
+                        gf_msg (this->name, GF_LOG_ERROR, 0,
+                                AFR_MSG_INVALID_SUBVOL, "%s not a subvolume",
                                 read_subvol->name);
                         goto out;
                 }
@@ -166,20 +197,26 @@ reconfigure (xlator_t *this, dict_t *options)
         if (read_subvol_index >-1) {
                 index=read_subvol_index;
                 if (index >= priv->child_count) {
-                        gf_log (this->name, GF_LOG_ERROR, "%d not a subvolume-index",
-                                index);
+                        gf_msg (this->name, GF_LOG_ERROR, 0,
+                                AFR_MSG_INVALID_SUBVOL,
+                                "%d not a subvolume-index", index);
                         goto out;
                 }
                 priv->read_child = index;
         }
 
-        GF_OPTION_RECONF ("pre-op-compat", priv->pre_op_compat, options, bool, out);
+        GF_OPTION_RECONF ("pre-op-compat", priv->pre_op_compat, options, bool,
+                          out);
+        GF_OPTION_RECONF ("locking-scheme", priv->locking_scheme, options, str,
+                          out);
+        GF_OPTION_RECONF ("granular-entry-heal", priv->esh_granular, options,
+                          bool, out);
 
         GF_OPTION_RECONF ("eager-lock", priv->eager_lock, options, bool, out);
         GF_OPTION_RECONF ("quorum-type", qtype, options, str, out);
         GF_OPTION_RECONF ("quorum-count", priv->quorum_count, options,
                           uint32, out);
-        fix_quorum_options(this,priv,qtype);
+        fix_quorum_options (this, priv, qtype, options);
         if (priv->quorum_count && !afr_has_quorum (priv->child_up, this))
                 gf_msg (this->name, GF_LOG_WARNING, 0, AFR_MSG_QUORUM_FAIL,
                         "Client-quorum is not met");
@@ -200,6 +237,25 @@ reconfigure (xlator_t *this, dict_t *options)
 	GF_OPTION_RECONF ("iam-self-heal-daemon", priv->shd.iamshd, options,
 			  bool, out);
 
+        GF_OPTION_RECONF ("heal-timeout", priv->shd.timeout, options,
+                          int32, out);
+
+        GF_OPTION_RECONF ("quorum-reads", priv->quorum_reads, options,
+                          bool, out);
+        GF_OPTION_RECONF ("consistent-metadata", priv->consistent_metadata,
+                          options, bool, out);
+
+        GF_OPTION_RECONF ("shd-max-threads", priv->shd.max_threads,
+                          options, uint32, out);
+
+        GF_OPTION_RECONF ("shd-wait-qlength", priv->shd.wait_qlength,
+                          options, uint32, out);
+
+        GF_OPTION_RECONF ("favorite-child-policy", fav_child_policy, options,
+                          str, out);
+        if (afr_set_favorite_child_policy (priv, fav_child_policy) == -1)
+                goto out;
+
         priv->did_discovery = _gf_false;
 
         ret = 0;
@@ -218,6 +274,67 @@ static const char *favorite_child_warning_str = "You have specified subvolume '%
         "WILL BE LOST.";
 
 
+static int
+afr_pending_xattrs_init (afr_private_t *priv, xlator_t *this)
+{
+        int ret = -1;
+        int i = 0;
+        char *ptr = NULL;
+        char *ptr1 = NULL;
+        char *xattrs_list = NULL;
+        xlator_list_t *trav = NULL;
+
+        trav = this->children;
+
+        GF_OPTION_INIT ("afr-pending-xattr", xattrs_list, str, out);
+        priv->pending_key = GF_CALLOC (sizeof (*priv->pending_key),
+                                       priv->child_count, gf_afr_mt_char);
+        if (!priv->pending_key) {
+                ret = -ENOMEM;
+                goto out;
+        }
+        if (!xattrs_list) {
+                gf_msg (this->name, GF_LOG_WARNING, 0, AFR_MSG_NO_CHANGELOG,
+                        "Unable to fetch afr-pending-xattr option from volfile."
+                        " Falling back to using client translator names. ");
+
+                while (i < priv->child_count) {
+                        ret = gf_asprintf (&priv->pending_key[i], "%s.%s",
+                                           AFR_XATTR_PREFIX,
+                                           trav->xlator->name);
+                        if (ret == -1) {
+                                ret = -ENOMEM;
+                                goto out;
+                        }
+                        trav = trav->next;
+                        i++;
+                }
+                ret = 0;
+                goto out;
+        }
+
+        ptr = ptr1 = gf_strdup (xattrs_list);
+        if (!ptr) {
+                ret = -ENOMEM;
+                goto out;
+        }
+        for (i = 0, ptr = strtok (ptr, ","); ptr; ptr = strtok (NULL, ",")) {
+                ret = gf_asprintf (&priv->pending_key[i], "%s.%s",
+                                   AFR_XATTR_PREFIX, ptr);
+                if (ret == -1) {
+                        ret = -ENOMEM;
+                        goto out;
+                }
+                i++;
+        }
+        ret = 0;
+
+out:
+        GF_FREE (ptr1);
+        return ret;
+
+}
+
 int32_t
 init (xlator_t *this)
 {
@@ -231,17 +348,19 @@ init (xlator_t *this)
         int            read_subvol_index = -1;
         xlator_t      *fav_child   = NULL;
         char          *qtype       = NULL;
+        char          *fav_child_policy = NULL;
 
         if (!this->children) {
-                gf_log (this->name, GF_LOG_ERROR,
+                gf_msg (this->name, GF_LOG_ERROR, 0,
+                        AFR_MSG_CHILD_MISCONFIGURED,
                         "replicate translator needs more than one "
                         "subvolume defined.");
                 return -1;
         }
 
         if (!this->parents) {
-                gf_log (this->name, GF_LOG_WARNING,
-                        "Volume is dangling.");
+                gf_msg (this->name, GF_LOG_WARNING, 0,
+                        AFR_MSG_VOL_MISCONFIGURED, "Volume is dangling.");
         }
 
 	this->private = GF_CALLOC (1, sizeof (afr_private_t),
@@ -258,6 +377,12 @@ init (xlator_t *this)
 
         priv->read_child = -1;
 
+        GF_OPTION_INIT ("arbiter-count", priv->arbiter_count, uint32, out);
+        INIT_LIST_HEAD (&priv->healing);
+        INIT_LIST_HEAD (&priv->heal_waiting);
+
+        priv->spb_choice_timeout = AFR_DEFAULT_SPB_CHOICE_TIMEOUT;
+
 	GF_OPTION_INIT ("afr-dirty-xattr", priv->afr_dirty, str, out);
 
 	GF_OPTION_INIT ("metadata-splitbrain-forced-heal",
@@ -267,7 +392,8 @@ init (xlator_t *this)
         if (read_subvol) {
                 priv->read_child = xlator_subvolume_index (this, read_subvol);
                 if (priv->read_child == -1) {
-                        gf_log (this->name, GF_LOG_ERROR, "%s not a subvolume",
+                        gf_msg (this->name, GF_LOG_ERROR, 0,
+                                AFR_MSG_INVALID_SUBVOL, "%s not a subvolume",
                                 read_subvol->name);
                         goto out;
                 }
@@ -275,8 +401,9 @@ init (xlator_t *this)
         GF_OPTION_INIT ("read-subvolume-index",read_subvol_index,int32,out);
         if (read_subvol_index > -1) {
                 if (read_subvol_index >= priv->child_count) {
-                        gf_log (this->name, GF_LOG_ERROR, "%d not a subvolume-index",
-                                read_subvol_index);
+                        gf_msg (this->name, GF_LOG_ERROR, 0,
+                                AFR_MSG_INVALID_SUBVOL,
+                                "%d not a subvolume-index", read_subvol_index);
                         goto out;
                 }
                 priv->read_child = read_subvol_index;
@@ -290,18 +417,32 @@ init (xlator_t *this)
         if (fav_child) {
                 priv->favorite_child = xlator_subvolume_index (this, fav_child);
                 if (priv->favorite_child == -1) {
-                        gf_log (this->name, GF_LOG_ERROR, "%s not a subvolume",
+                        gf_msg (this->name, GF_LOG_ERROR, 0,
+                                AFR_MSG_INVALID_SUBVOL, "%s not a subvolume, "
+                                "cannot set it as favorite child",
                                 fav_child->name);
                         goto out;
                 }
-                gf_log (this->name, GF_LOG_WARNING,
+                gf_msg (this->name, GF_LOG_WARNING, 0, AFR_MSG_FAVORITE_CHILD,
                         favorite_child_warning_str, fav_child->name,
                         fav_child->name, fav_child->name);
         }
 
+        GF_OPTION_INIT ("favorite-child-policy", fav_child_policy, str, out);
+        if (afr_set_favorite_child_policy(priv, fav_child_policy) == -1)
+                goto out;
+
+        GF_OPTION_INIT ("shd-max-threads", priv->shd.max_threads,
+                         uint32, out);
+
+        GF_OPTION_INIT ("shd-wait-qlength", priv->shd.wait_qlength,
+                         uint32, out);
 
         GF_OPTION_INIT ("background-self-heal-count",
                         priv->background_self_heal_count, uint32, out);
+
+        GF_OPTION_INIT ("heal-wait-queue-length",
+                        priv->heal_wait_qlen, uint32, out);
 
         GF_OPTION_INIT ("data-self-heal", priv->data_self_heal, str, out);
 
@@ -331,13 +472,15 @@ init (xlator_t *this)
         GF_OPTION_INIT ("entrylk-trace", priv->entrylk_trace, bool, out);
 
         GF_OPTION_INIT ("pre-op-compat", priv->pre_op_compat, bool, out);
+        GF_OPTION_INIT ("locking-scheme", priv->locking_scheme, str, out);
+        GF_OPTION_INIT ("granular-entry-heal", priv->esh_granular, bool, out);
 
         GF_OPTION_INIT ("eager-lock", priv->eager_lock, bool, out);
         GF_OPTION_INIT ("quorum-type", qtype, str, out);
         GF_OPTION_INIT ("quorum-count", priv->quorum_count, uint32, out);
         GF_OPTION_INIT (AFR_SH_READDIR_SIZE_KEY, priv->sh_readdir_size, size_uint64,
                         out);
-        fix_quorum_options(this,priv,qtype);
+        fix_quorum_options (this, priv, qtype, this->options);
 
 	GF_OPTION_INIT ("post-op-delay-secs", priv->post_op_delay_secs, uint32, out);
         GF_OPTION_INIT ("ensure-durability", priv->ensure_durability, bool,
@@ -346,8 +489,20 @@ init (xlator_t *this)
 	GF_OPTION_INIT ("self-heal-daemon", priv->shd.enabled, bool, out);
 
 	GF_OPTION_INIT ("iam-self-heal-daemon", priv->shd.iamshd, bool, out);
+        GF_OPTION_INIT ("heal-timeout", priv->shd.timeout, int32, out);
+
+        GF_OPTION_INIT ("quorum-reads", priv->quorum_reads, bool, out);
+        GF_OPTION_INIT ("consistent-metadata", priv->consistent_metadata, bool,
+                        out);
 
         priv->wait_count = 1;
+
+        priv->local = GF_CALLOC (sizeof (unsigned char), child_count,
+                                 gf_afr_mt_char);
+        if (!priv->local) {
+                ret = -ENOMEM;
+                goto out;
+        }
 
         priv->child_up = GF_CALLOC (sizeof (unsigned char), child_count,
                                     gf_afr_mt_char);
@@ -370,27 +525,14 @@ init (xlator_t *this)
                 goto out;
         }
 
-        priv->pending_key = GF_CALLOC (sizeof (*priv->pending_key),
-                                       child_count,
-                                       gf_afr_mt_char);
-        if (!priv->pending_key) {
-                ret = -ENOMEM;
+        ret = afr_pending_xattrs_init (priv, this);
+        if (ret)
                 goto out;
-        }
 
         trav = this->children;
         i = 0;
         while (i < child_count) {
                 priv->children[i] = trav->xlator;
-
-                ret = gf_asprintf (&priv->pending_key[i], "%s.%s",
-                                   AFR_XATTR_PREFIX,
-                                   trav->xlator->name);
-                if (-1 == ret) {
-                        ret = -ENOMEM;
-                        goto out;
-                }
-
                 trav = trav->next;
                 i++;
         }
@@ -419,8 +561,6 @@ init (xlator_t *this)
         this->local_pool = mem_pool_new (afr_local_t, 512);
         if (!this->local_pool) {
                 ret = -1;
-                gf_log (this->name, GF_LOG_ERROR,
-                        "failed to create local_t's memory pool");
                 goto out;
         }
 
@@ -438,6 +578,12 @@ fini (xlator_t *this)
         afr_private_t *priv = NULL;
 
         priv = this->private;
+        LOCK (&priv->lock);
+        if (priv->timer != NULL) {
+                gf_timer_call_cancel(this->ctx, priv->timer);
+                priv->timer = NULL;
+        }
+        UNLOCK (&priv->lock);
         this->private = NULL;
         afr_priv_destroy (priv);
         //if (this->itable);//I dont see any destroy func
@@ -558,10 +704,21 @@ struct volume_options options[] = {
         { .key  = {"background-self-heal-count"},
           .type = GF_OPTION_TYPE_INT,
           .min  = 0,
-          .default_value = "16",
+          .max  = 256,
+          .default_value = "8",
           .validate = GF_OPT_VALIDATE_MIN,
-          .description = "This specifies the number of self-heals that can be "
-                         " performed in background without blocking the fop"
+          .description = "This specifies the number of per client self-heal "
+                         "jobs that can perform parallel heals in the "
+                         "background."
+        },
+        { .key  = {"heal-wait-queue-length"},
+          .type = GF_OPTION_TYPE_INT,
+          .min  = 0,
+          .max  = 10000, /*Around 100MB with sizeof(afr_local_t)= 10496 bytes*/
+          .default_value = "128",
+          .validate = GF_OPT_VALIDATE_MIN,
+          .description = "This specifies the number of heals that can be queued"
+                         " for the parallel background self heal jobs."
         },
         { .key  = {"data-self-heal"},
           .type = GF_OPTION_TYPE_STR,
@@ -657,16 +814,17 @@ struct volume_options options[] = {
         { .key = {"eager-lock"},
           .type = GF_OPTION_TYPE_BOOL,
           .default_value = "on",
-          .description = "Lock phase of a transaction has two sub-phases. "
+          .description = "Enable/Disable eager lock for replica volume. "
+                         "Lock phase of a transaction has two sub-phases. "
                          "First is an attempt to acquire locks in parallel by "
                          "broadcasting non-blocking lock requests. If lock "
                          "acquisition fails on any server, then the held locks "
-                         "are unlocked and revert to a blocking locked mode "
+                         "are unlocked and we revert to a blocking locks mode "
                          "sequentially on one server after another.  If this "
                          "option is enabled the initial broadcasting lock "
-                         "request attempt to acquire lock on the entire file. "
+                         "request attempts to acquire a full lock on the entire file. "
                          "If this fails, we revert back to the sequential "
-                         "\"regional\" blocking lock as before. In the case "
+                         "\"regional\" blocking locks as before. In the case "
                          "where such an \"eager\" lock is granted in the "
                          "non-blocking phase, it gives rise to an opportunity "
                          "for optimization. i.e, if the next write transaction "
@@ -712,6 +870,12 @@ struct volume_options options[] = {
                          "this many bricks or present.  Other quorum types "
                          "will OVERWRITE this value.",
         },
+        { .key = {"quorum-reads"},
+          .type = GF_OPTION_TYPE_BOOL,
+          .default_value = "no",
+          .description = "If quorum-reads is \"true\" only allow reads if "
+                         "quorum is met when quorum is enabled.",
+        },
         { .key  = {"node-uuid"},
           .type = GF_OPTION_TYPE_STR,
           .description = "Local glusterd uuid string, used in starting "
@@ -745,9 +909,82 @@ struct volume_options options[] = {
 	  .type = GF_OPTION_TYPE_STR,
 	  .default_value = AFR_DIRTY_DEFAULT,
 	},
+	{ .key = {"afr-pending-xattr"},
+	  .type = GF_OPTION_TYPE_STR,
+          .description = "Comma separated list of xattrs that are used to  "
+                         "capture information on pending heals."
+	},
 	{ .key = {"metadata-splitbrain-forced-heal"},
 	  .type = GF_OPTION_TYPE_BOOL,
 	  .default_value = "off",
 	},
+        { .key  = {"heal-timeout"},
+          .type = GF_OPTION_TYPE_INT,
+          .min  = 60,
+          .max  = INT_MAX,
+          .default_value = "600",
+          .description = "time interval for checking the need to self-heal "
+                         "in self-heal-daemon"
+        },
+        { .key = {"consistent-metadata"},
+          .type = GF_OPTION_TYPE_BOOL,
+          .default_value = "no",
+          .description = "If this option is enabled, readdirp will force "
+                         "lookups on those entries read whose read child is "
+                         "not the same as that of the parent. This will "
+                         "guarantee that all read operations on a file serve "
+                         "attributes from the same subvol as long as it holds "
+                         " a good copy of the file/dir.",
+        },
+        { .key = {"arbiter-count"},
+          .type = GF_OPTION_TYPE_INT,
+          .description = "subset of child_count. Has to be 0 or 1."
+        },
+        { .key   = {"shd-max-threads"},
+          .type  = GF_OPTION_TYPE_INT,
+          .min   = 1,
+          .max   = 64,
+          .default_value = "1",
+           .description = "Maximum number of threads SHD can use per local "
+                          "brick.  This can substantially lower heal times, "
+                          "but can also crush your bricks if you don't have "
+                          "the storage hardware to support this."
+        },
+        { .key   = {"shd-wait-qlength"},
+          .type  = GF_OPTION_TYPE_INT,
+          .min   = 1,
+          .max   = 655536,
+          .default_value = "1024",
+           .description = "This option can be used to control number of heals"
+                          " that can wait in SHD per subvolume",
+        },
+        { .key = {"locking-scheme"},
+          .type = GF_OPTION_TYPE_STR,
+          .value = { "full", "granular"},
+          .default_value = "full",
+          .description = "If this option is set to granular, self-heal will "
+                         "stop being compatible with afr-v1, which helps afr "
+                         "be more granular while self-healing",
+        },
+        { .key = {"granular-entry-heal"},
+          .type = GF_OPTION_TYPE_BOOL,
+          .default_value = "no",
+          .description = "If this option is enabled, self-heal will resort to "
+                         "granular way of recording changelogs and doing entry "
+                         "self-heal.",
+        },
+        { .key   = {"favorite-child-policy"},
+          .type  = GF_OPTION_TYPE_STR,
+          .value = {"none", "size", "ctime", "mtime", "majority"},
+          .default_value = "none",
+          .description = "This option can be used to automatically resolve "
+                         "split-brains using various policies without user "
+                         "intervention. \"size\" picks the file with the "
+                         "biggest size as the source. \"ctime\" and \"mtime\" "
+                         "pick the file with the latest ctime and mtime "
+                         "respectively as the source. \"majority\" picks a file"
+                         " with identical mtime and size in more than half the "
+                         "number of bricks in the replica.",
+        },
         { .key  = {NULL} },
 };

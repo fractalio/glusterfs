@@ -19,11 +19,6 @@
 #include <sys/time.h>
 #include <fnmatch.h>
 
-#ifndef _CONFIG_H
-#define _CONFIG_H
-#include "config.h"
-#endif /* _CONFIG_H */
-
 #include "glusterfs.h"
 #include "logging.h"
 #include "xlator.h"
@@ -46,7 +41,7 @@
 #include "gidcache.h"
 
 #if defined(GF_LINUX_HOST_OS) || defined(__FreeBSD__) || defined(__NetBSD__)
-#define FUSE_OP_HIGH (FUSE_READDIRPLUS + 1)
+#define FUSE_OP_HIGH (FUSE_LSEEK + 1)
 #endif
 #ifdef GF_DARWIN_HOST_OS
 #define FUSE_OP_HIGH (FUSE_DESTROY + 1)
@@ -115,8 +110,9 @@ struct fuse_private {
         char                *fuse_mountopts;
 
         /* For fuse-reverse-validation */
-        int                  revchan_in;
-        int                  revchan_out;
+        struct list_head     invalidate_list;
+        pthread_cond_t       invalidate_cond;
+        pthread_mutex_t      invalidate_mutex;
         gf_boolean_t         reverse_fuse_thread_started;
 
         /* For communicating with separate mount thread. */
@@ -128,8 +124,30 @@ struct fuse_private {
 
         /* for using fuse-kernel readdirp*/
         gf_boolean_t use_readdirp;
+
+        /* fini started, helps prevent multiple epoll worker threads
+         * firing up the fini routine */
+        gf_boolean_t fini_invoked;
+
+        /* resolve gid with getgrouplist() instead of /proc/%d/status */
+        gf_boolean_t resolve_gids;
+
+        /* Enable or disable capability support */
+        gf_boolean_t         capability;
 };
 typedef struct fuse_private fuse_private_t;
+
+#define INVAL_BUF_SIZE (sizeof (struct fuse_out_header) +               \
+                        max (sizeof (struct fuse_notify_inval_inode_out), \
+                             sizeof (struct fuse_notify_inval_entry_out) + \
+                             NAME_MAX + 1))
+
+
+struct fuse_invalidate_node {
+        char             inval_buf[INVAL_BUF_SIZE];
+        struct list_head next;
+};
+typedef struct fuse_invalidate_node fuse_invalidate_node_t;
 
 struct fuse_graph_switch_args {
         xlator_t        *this;
@@ -138,16 +156,14 @@ struct fuse_graph_switch_args {
 };
 typedef struct fuse_graph_switch_args fuse_graph_switch_args_t;
 
-#define INVAL_BUF_SIZE (sizeof (struct fuse_out_header) +               \
-                        max (sizeof (struct fuse_notify_inval_inode_out), \
-                             sizeof (struct fuse_notify_inval_entry_out) + \
-                             NAME_MAX + 1))
-
 #define FUSE_EVENT_HISTORY_SIZE 1024
 
 #define _FH_TO_FD(fh) ((fd_t *)(uintptr_t)(fh))
 
 #define FH_TO_FD(fh) ((_FH_TO_FD (fh))?(fd_ref (_FH_TO_FD (fh))):((fd_t *) 0))
+
+/* Use the same logic as the Linux NFS-client */
+#define GF_FUSE_SQUASH_INO(ino) (((uint32_t) ino) ^ (ino >> 32))
 
 #define FUSE_FOP(state, ret, op_num, fop, args ...)                     \
         do {                                                            \
@@ -367,6 +383,8 @@ typedef struct {
         uuid_t         gfid;
         uint32_t       io_flags;
         int32_t        fd_no;
+
+        gf_seek_what_t whence;
 } fuse_state_t;
 
 typedef struct {
@@ -406,4 +424,5 @@ int fuse_resolve_fd_init (fuse_state_t *state, fuse_resolve_t *resolve,
 int fuse_ignore_xattr_set (fuse_private_t *priv, char *key);
 void fuse_fop_resume (fuse_state_t *state);
 int dump_history_fuse (circular_buffer_t *cb, void *data);
+int fuse_check_selinux_cap_xattr (fuse_private_t *priv, char *name);
 #endif /* _GF_FUSE_BRIDGE_H_ */

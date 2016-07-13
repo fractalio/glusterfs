@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2006-2012 Red Hat, Inc. <http://www.redhat.com>
+   Copyright (c) 2006-2012, 2015-2016 Red Hat, Inc. <http://www.redhat.com>
    This file is part of GlusterFS.
 
    This file is licensed to you under your choice of the GNU Lesser
@@ -10,11 +10,6 @@
 #ifndef __POSIX_LOCKS_H__
 #define __POSIX_LOCKS_H__
 
-#ifndef _CONFIG_H
-#define _CONFIG_H
-#include "config.h"
-#endif
-
 #include "compat-errno.h"
 #include "stack.h"
 #include "call-stub.h"
@@ -22,6 +17,13 @@
 #include "client_t.h"
 
 #include "lkowner.h"
+
+typedef enum {
+        MLK_NONE,
+        MLK_FILE_BASED,
+        MLK_FORCED,
+        MLK_OPTIMAL
+} mlk_mode_t; /* defines different mandatory locking modes*/
 
 struct __pl_fd;
 
@@ -31,6 +33,7 @@ struct __posix_lock {
         short              fl_type;
         off_t              fl_start;
         off_t              fl_end;
+        uint32_t           lk_flags;
 
         short              blocked;    /* waiting to acquire */
         struct gf_flock    user_flock; /* the flock supplied by the user */
@@ -47,8 +50,20 @@ struct __posix_lock {
            across nodes */
 
         void              *client;     /* to identify client node */
+
+        /* This field uniquely identifies the client the lock belongs to.  As
+         * lock migration is handled by rebalance, the client_t object will be
+         * overwritten by rebalance and can't be deemed as the owner of the
+         * lock on destination. Hence, the below field is migrated from
+         * source to destination by lock_migration_info_t and updated on the
+         * destination. So that on client-server disconnection, server can
+         * cleanup the locks proper;y.  */
+
+        char              *client_uid;
         gf_lkowner_t       owner;
         pid_t              client_pid;    /* pid of client process */
+
+        int                blocking;
 };
 typedef struct __posix_lock posix_lock_t;
 
@@ -142,6 +157,10 @@ struct __pl_inode {
         struct list_head reservelk_list;        /* list of reservelks */
         struct list_head blocked_reservelks;        /* list of blocked reservelks */
         struct list_head blocked_calls;  /* List of blocked lock calls while a reserve is held*/
+        struct list_head metalk_list;    /* Meta lock list */
+         /* This is to store the incoming lock
+            requests while meta lock is enabled */
+        struct list_head queued_locks;
         int              mandatory;      /* if mandatory locking is enabled */
 
         inode_t          *refkeeper;     /* hold refs on an inode while locks are
@@ -150,12 +169,25 @@ struct __pl_inode {
         inode_t          *inode;         /* pointer to be used for ref and unref
                                             of inode_t as long as there are
                                             locks on it */
+        gf_boolean_t     migrated;
 };
 typedef struct __pl_inode pl_inode_t;
 
+struct __pl_metalk {
+        pthread_mutex_t mutex;
+        /* For pl_inode meta lock list */
+        struct list_head        list;
+        /* For pl_ctx_t list */
+        struct list_head        client_list;
+        char                   *client_uid;
+
+        pl_inode_t             *pl_inode;
+        int                     ref;
+};
+typedef struct __pl_metalk pl_meta_lock_t;
 
 typedef struct {
-        gf_boolean_t    mandatory;      /* if mandatory locking is enabled */
+        mlk_mode_t      mandatory_mode; /* holds current mandatory locking mode */
         gf_boolean_t    trace;          /* trace lock requests in and out */
         char           *brickname;
 } posix_locks_private_t;
@@ -164,16 +196,15 @@ typedef struct {
 typedef struct {
         gf_boolean_t   entrylk_count_req;
         gf_boolean_t   inodelk_count_req;
-        gf_boolean_t   inodelk_dom_count_req;
         gf_boolean_t   posixlk_count_req;
         gf_boolean_t   parent_entrylk_req;
+        data_t        *inodelk_dom_count_req;
 
-        /* used by {f,}truncate */
-        loc_t  loc;
+        dict_t  *xdata;
+        loc_t  loc[2];
         fd_t  *fd;
         off_t  offset;
-        dict_t *xdata;
-        enum {TRUNCATE, FTRUNCATE} op;
+        glusterfs_fop_t op;
 } pl_local_t;
 
 
@@ -193,6 +224,7 @@ typedef struct _locks_ctx {
         pthread_mutex_t      lock;
         struct list_head     inodelk_lockers;
         struct list_head     entrylk_lockers;
+        struct list_head     metalk_list;
 } pl_ctx_t;
 
 

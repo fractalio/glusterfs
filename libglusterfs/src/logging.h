@@ -11,11 +11,6 @@
 #ifndef __LOGGING_H__
 #define __LOGGING_H__
 
-#ifndef _CONFIG_H
-#define _CONFIG_H
-#include "config.h"
-#endif
-
 #include <sys/time.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -94,12 +89,14 @@ typedef enum {
         /* NOTE: In the future journald, lumberjack, next new thing here */
 } gf_log_logger_t;
 
-#define DEFAULT_LOG_FILE_DIRECTORY            DATADIR "/log/glusterfs"
-#define DEFAULT_LOG_LEVEL                     GF_LOG_INFO
+#define DEFAULT_LOG_FILE_DIRECTORY          DATADIR "/log/glusterfs"
+#define DEFAULT_QUOTA_CRAWL_LOG_DIRECTORY   DATADIR "/log/glusterfs/quota_crawl"
+#define DEFAULT_LOG_LEVEL                   GF_LOG_INFO
 
 typedef struct gf_log_handle_ {
         pthread_mutex_t   logfile_mutex;
         uint8_t           logrotate;
+        uint8_t           cmd_history_logrotate;
         gf_loglevel_t     loglevel;
         int               gf_log_syslog;
         gf_loglevel_t     sys_log_level;
@@ -138,7 +135,7 @@ typedef struct log_buf_ {
         struct list_head msg_list;
 } log_buf_t;
 
-void gf_log_globals_init (void *ctx);
+void gf_log_globals_init (void *ctx, gf_loglevel_t level);
 int gf_log_init (void *data, const char *filename, const char *ident);
 
 void gf_log_logrotate (int signum);

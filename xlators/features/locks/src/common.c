@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2006-2012 Red Hat, Inc. <http://www.redhat.com>
+   Copyright (c) 2006-2012, 2015-2016 Red Hat, Inc. <http://www.redhat.com>
    This file is part of GlusterFS.
 
    This file is licensed to you under your choice of the GNU Lesser
@@ -11,11 +11,6 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
-
-#ifndef _CONFIG_H
-#define _CONFIG_H
-#include "config.h"
-#endif
 
 #include "glusterfs.h"
 #include "compat.h"
@@ -437,9 +432,16 @@ pl_inode_get (xlator_t *this, inode_t *inode)
                 INIT_LIST_HEAD (&pl_inode->reservelk_list);
                 INIT_LIST_HEAD (&pl_inode->blocked_reservelks);
                 INIT_LIST_HEAD (&pl_inode->blocked_calls);
-                uuid_copy (pl_inode->gfid, inode->gfid);
+                INIT_LIST_HEAD (&pl_inode->metalk_list);
+		INIT_LIST_HEAD (&pl_inode->queued_locks);
+                gf_uuid_copy (pl_inode->gfid, inode->gfid);
 
-                __inode_ctx_put (inode, this, (uint64_t)(long)(pl_inode));
+                ret = __inode_ctx_put (inode, this, (uint64_t)(long)(pl_inode));
+                if (ret) {
+                        GF_FREE (pl_inode);
+                        pl_inode = NULL;
+                        goto unlock;
+                }
         }
 unlock:
         UNLOCK (&inode->lock);
@@ -451,7 +453,7 @@ unlock:
 /* Create a new posix_lock_t */
 posix_lock_t *
 new_posix_lock (struct gf_flock *flock, client_t *client, pid_t client_pid,
-                gf_lkowner_t *owner, fd_t *fd)
+                gf_lkowner_t *owner, fd_t *fd, uint32_t lk_flags, int blocking)
 {
         posix_lock_t *lock = NULL;
 
@@ -474,10 +476,20 @@ new_posix_lock (struct gf_flock *flock, client_t *client, pid_t client_pid,
                 lock->fl_end = flock->l_start + flock->l_len - 1;
 
         lock->client     = client;
+
+        lock->client_uid = gf_strdup (client->client_uid);
+        if (lock->client_uid == NULL) {
+                GF_FREE (lock);
+                goto out;
+        }
+
         lock->fd_num     = fd_to_fdnum (fd);
         lock->fd         = fd;
         lock->client_pid = client_pid;
         lock->owner      = *owner;
+        lock->lk_flags   = lk_flags;
+
+        lock->blocking  = blocking;
 
         INIT_LIST_HEAD (&lock->list);
 
@@ -488,7 +500,7 @@ out:
 
 /* Delete a lock from the inode's lock list */
 void
-__delete_lock (pl_inode_t *pl_inode, posix_lock_t *lock)
+__delete_lock (posix_lock_t *lock)
 {
         list_del_init (&lock->list);
 }
@@ -567,7 +579,7 @@ __delete_unlck_locks (pl_inode_t *pl_inode)
 
         list_for_each_entry_safe (l, tmp, &pl_inode->ext_list, list) {
                 if (l->fl_type == F_UNLCK) {
-                        __delete_lock (pl_inode, l);
+                        __delete_lock (l);
                         __destroy_lock (l);
                 }
         }
@@ -788,6 +800,7 @@ __insert_and_merge (pl_inode_t *pl_inode, posix_lock_t *lock)
         posix_lock_t  *sum = NULL;
         int            i = 0;
         struct _values v = { .locks = {0, 0, 0} };
+        client_t      *client = NULL;
 
         list_for_each_entry_safe (conf, t, &pl_inode->ext_list, list) {
                 if (conf->blocked)
@@ -796,16 +809,21 @@ __insert_and_merge (pl_inode_t *pl_inode, posix_lock_t *lock)
                         continue;
 
                 if (same_owner (conf, lock)) {
-                        if (conf->fl_type == lock->fl_type) {
+                        if (conf->fl_type == lock->fl_type &&
+                                        conf->lk_flags == lock->lk_flags) {
                                 sum = add_locks (lock, conf);
 
                                 sum->fl_type    = lock->fl_type;
                                 sum->client     = lock->client;
+                                client          = sum->client;
+                                sum->client_uid =
+                                         gf_strdup (client->client_uid);
                                 sum->fd_num     = lock->fd_num;
                                 sum->client_pid = lock->client_pid;
                                 sum->owner      = lock->owner;
+                                sum->lk_flags   = lock->lk_flags;
 
-                                __delete_lock (pl_inode, conf);
+                                __delete_lock (conf);
                                 __destroy_lock (conf);
 
                                 __destroy_lock (lock);
@@ -819,16 +837,21 @@ __insert_and_merge (pl_inode_t *pl_inode, posix_lock_t *lock)
 
                                 sum->fl_type    = conf->fl_type;
                                 sum->client     = conf->client;
+                                client          = sum->client;
+                                sum->client_uid =
+                                         gf_strdup (client->client_uid);
+
                                 sum->fd_num     = conf->fd_num;
                                 sum->client_pid = conf->client_pid;
                                 sum->owner      = conf->owner;
+                                sum->lk_flags   = conf->lk_flags;
 
                                 v = subtract_locks (sum, lock);
 
-                                __delete_lock (pl_inode, conf);
+                                __delete_lock (conf);
                                 __destroy_lock (conf);
 
-                                __delete_lock (pl_inode, lock);
+                                __delete_lock (lock);
                                 __destroy_lock (lock);
 
                                 __destroy_lock (sum);
@@ -978,7 +1001,7 @@ pl_send_prelock_unlock (xlator_t *this, pl_inode_t *pl_inode,
 
         unlock_lock = new_posix_lock (&flock, old_lock->client,
                                       old_lock->client_pid, &old_lock->owner,
-                                      old_lock->fd);
+                                      old_lock->fd, old_lock->lk_flags, 0);
         GF_VALIDATE_OR_GOTO (this->name, unlock_lock, out);
         ret = 0;
 
@@ -1030,6 +1053,12 @@ pl_setlk (xlator_t *this, pl_inode_t *pl_inode, posix_lock_t *lock,
                 }
 
                 if (__is_lock_grantable (pl_inode, lock)) {
+                        if (pl_metalock_is_active (pl_inode)) {
+                                __pl_queue_lock (pl_inode, lock, can_block);
+                                pthread_mutex_unlock (&pl_inode->mutex);
+                                ret = -2;
+                                goto out;
+                        }
                         gf_log (this->name, GF_LOG_TRACE,
                                 "%s (pid=%d) lk-owner:%s %"PRId64" - %"PRId64" => OK",
                                 lock->fl_type == F_UNLCK ? "Unlock" : "Lock",
@@ -1039,6 +1068,12 @@ pl_setlk (xlator_t *this, pl_inode_t *pl_inode, posix_lock_t *lock,
                                 lock->user_flock.l_len);
                         __insert_and_merge (pl_inode, lock);
                 } else if (can_block) {
+                        if (pl_metalock_is_active (pl_inode)) {
+                                __pl_queue_lock (pl_inode, lock, can_block);
+                                pthread_mutex_unlock (&pl_inode->mutex);
+                                ret = -2;
+                                goto out;
+                        }
                         gf_log (this->name, GF_LOG_TRACE,
                                 "%s (pid=%d) lk-owner:%s %"PRId64" - %"PRId64" => Blocked",
                                 lock->fl_type == F_UNLCK ? "Unlock" : "Lock",
@@ -1067,6 +1102,7 @@ pl_setlk (xlator_t *this, pl_inode_t *pl_inode, posix_lock_t *lock,
 
         do_blocked_rw (pl_inode);
 
+out:
         return ret;
 }
 
@@ -1085,4 +1121,3 @@ pl_getlk (pl_inode_t *pl_inode, posix_lock_t *lock)
 
         return conf;
 }
-

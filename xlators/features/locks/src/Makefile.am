@@ -1,13 +1,13 @@
 xlator_LTLIBRARIES = locks.la
 xlatordir = $(libdir)/glusterfs/$(PACKAGE_VERSION)/xlator/features
 
-locks_la_LDFLAGS = -module -avoid-version
+locks_la_LDFLAGS = -module $(GF_XLATOR_DEFAULT_LDFLAGS)
 
 locks_la_SOURCES = common.c posix.c entrylk.c inodelk.c reservelk.c \
 		   clear.c
 locks_la_LIBADD = $(top_builddir)/libglusterfs/src/libglusterfs.la
 
-noinst_HEADERS = locks.h common.h locks-mem-types.h clear.h
+noinst_HEADERS = locks.h common.h locks-mem-types.h clear.h pl-messages.h
 
 AM_CPPFLAGS = $(GF_CPPFLAGS) -I$(top_srcdir)/libglusterfs/src
 

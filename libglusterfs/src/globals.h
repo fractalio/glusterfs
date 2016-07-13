@@ -12,6 +12,7 @@
 #define _GLOBALS_H
 
 #define GF_DEFAULT_BASE_PORT 24007
+#define GF_DEFAULT_VOLFILE_TRANSPORT "tcp"
 
 #define GD_OP_VERSION_KEY     "operating-version"
 #define GD_MIN_OP_VERSION_KEY "minimum-operating-version"
@@ -25,6 +26,8 @@
  * 3.5.1                - 30501
  * 3.6.0                - 30600
  * 3.7.0                - 30700
+ * 3.7.1                - 30701
+ * 3.7.2                - 30702
  *
  * Starting with Gluster v3.6, the op-version will be multi-digit integer values
  * based on the Glusterfs version, instead of a simply incrementing integer
@@ -35,13 +38,39 @@
  */
 #define GD_OP_VERSION_MIN  1 /* MIN is the fresh start op-version, mostly
                                 should not change */
-#define GD_OP_VERSION_MAX  30700 /* MAX VERSION is the maximum count in VME
-                                    table, should keep changing with
-                                    introduction of newer versions */
+#define GD_OP_VERSION_MAX  GD_OP_VERSION_4_0_0 /* MAX VERSION is the maximum
+                                                  count in VME table, should
+                                                  keep changing with
+                                                  introduction of newer
+                                                  versions */
 
 #define GD_OP_VERSION_3_6_0    30600 /* Op-Version for GlusterFS 3.6.0 */
 
 #define GD_OP_VERSION_3_7_0    30700 /* Op-version for GlusterFS 3.7.0 */
+
+#define GD_OP_VERSION_3_7_1    30701 /* Op-version for GlusterFS 3.7.1 */
+
+#define GD_OP_VERSION_3_7_2    30702 /* Op-version for GlusterFS 3.7.2 */
+
+#define GD_OP_VERSION_3_7_3    30703 /* Op-version for GlusterFS 3.7.3 */
+
+#define GD_OP_VERSION_3_7_4    30704 /* Op-version for GlusterFS 3.7.4 */
+
+#define GD_OP_VERSION_3_7_5    30705 /* Op-version for GlusterFS 3.7.5 */
+
+#define GD_OP_VERSION_3_7_6    30706 /* Op-version for GlusterFS 3.7.6 */
+
+#define GD_OP_VERSION_3_7_7    30707 /* Op-version for GlusterFS 3.7.7 */
+
+#define GD_OP_VERSION_3_7_10   30710 /* Op-version for GlusterFS 3.7.10 */
+
+#define GD_OP_VERSION_3_7_12   30712 /* Op-version for GlusterFS 3.7.12 */
+
+#define GD_OP_VERSION_3_8_0    30800 /* Op-version for GlusterFS 3.8.0 */
+
+#define GD_OP_VERSION_3_9_0    30900 /* Op-version for GlusterFS 3.9.0 */
+
+#define GD_OP_VERSION_4_0_0    40000 /* Op-version for GlusterFS 4.0.0 */
 
 #define GD_OP_VER_PERSISTENT_AFR_XATTRS GD_OP_VERSION_3_6_0
 
@@ -49,27 +78,33 @@
 
 /* THIS */
 #define THIS (*__glusterfs_this_location())
+#define DECLARE_OLD_THIS        xlator_t *old_THIS = THIS
 
-xlator_t **__glusterfs_this_location ();
-xlator_t *glusterfs_this_get ();
+xlator_t **__glusterfs_this_location (void);
+xlator_t *glusterfs_this_get (void);
 int glusterfs_this_set (xlator_t *);
 
 /* syncopctx */
-void *syncopctx_getctx ();
+void *syncopctx_getctx (void);
 int syncopctx_setctx (void *ctx);
 
 /* task */
-void *synctask_get ();
+void *synctask_get (void);
 int synctask_set (void *);
 
 /* uuid_buf */
-char *glusterfs_uuid_buf_get();
+char *glusterfs_uuid_buf_get (void);
 /* lkowner_buf */
-char *glusterfs_lkowner_buf_get();
+char *glusterfs_lkowner_buf_get (void);
+/* leaseid buf */
+char *glusterfs_leaseid_buf_get (void);
 
 /* init */
 int glusterfs_globals_init (glusterfs_ctx_t *ctx);
 
 extern const char *gf_fop_list[];
 
+/* mem acct enable/disable */
+int gf_global_mem_acct_enable_get (void);
+int gf_global_mem_acct_enable_set (int val);
 #endif /* !_GLOBALS_H */

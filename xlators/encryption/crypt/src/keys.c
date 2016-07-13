@@ -8,17 +8,12 @@
   cases as published by the Free Software Foundation.
 */
 
-#ifndef _CONFIG_H
-#define _CONFIG_H
-#include "config.h"
-#endif
-
 #include "defaults.h"
 #include "crypt-common.h"
 #include "crypt.h"
 
 /* Key hierarchy
-                  
+
                    +----------------+
                    | MASTER_VOL_KEY |
                    +-------+--------+
@@ -68,7 +63,7 @@ static int32_t kderive_init(struct kderive_context *ctx,
 			    crypt_key_type type  /* type of child key */)
 {
 	unsigned char *pos;
-	uint32_t llen = strlen(crypt_keys[type].label);	
+	uint32_t llen = strlen(crypt_keys[type].label);
 	/*
 	 * Compoud the fixed input data for KDF:
 	 * [i]_2 || Label || 0x00 || Id-Context || [L]_2),
@@ -116,7 +111,7 @@ static int32_t kderive_init(struct kderive_context *ctx,
 }
 
 static void kderive_update(struct kderive_context *ctx)
-{	
+{
 	uint32_t i;
 	HMAC_CTX hctx;
 	unsigned char *pos = ctx->out;

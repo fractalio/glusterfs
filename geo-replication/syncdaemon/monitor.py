@@ -18,15 +18,40 @@ import xml.etree.ElementTree as XET
 from subprocess import PIPE
 from resource import Popen, FILE, GLUSTER, SSH
 from threading import Lock
+from errno import ECHILD, ESRCH
 import re
 import random
 from gconf import gconf
-from syncdutils import update_file, select, waitpid
+from syncdutils import select, waitpid, errno_wrap
 from syncdutils import set_term_handler, is_host_local, GsyncdError
 from syncdutils import escape, Thread, finalize, memoize
 
+from gsyncdstatus import GeorepStatus, set_monitor_status
+
 
 ParseError = XET.ParseError if hasattr(XET, 'ParseError') else SyntaxError
+
+
+def get_subvol_num(brick_idx, vol, hot):
+    tier = vol.is_tier()
+    disperse_count = vol.disperse_count(tier, hot)
+    replica_count = vol.replica_count(tier, hot)
+
+    if (tier and not hot):
+        brick_idx = brick_idx - vol.get_hot_bricks_count(tier)
+
+    subvol_size = disperse_count if disperse_count > 0 else replica_count
+    cnt = int((brick_idx + 1) / subvol_size)
+    rem = (brick_idx + 1) % subvol_size
+    if rem > 0:
+        cnt = cnt + 1
+
+    if (tier and hot):
+        return "hot_" + str(cnt)
+    elif (tier and not hot):
+        return "cold_" + str(cnt)
+    else:
+        return str(cnt)
 
 
 def get_slave_bricks_status(host, vol):
@@ -35,7 +60,12 @@ def get_slave_bricks_status(host, vol):
                stdout=PIPE, stderr=PIPE)
     vix = po.stdout.read()
     po.wait()
-    po.terminate_geterr()
+    po.terminate_geterr(fail_on_err=False)
+    if po.returncode != 0:
+        logging.info("Volume status command failed, unable to get "
+                     "list of up nodes of %s, returning empty list: %s" %
+                     (vol, po.returncode))
+        return []
     vi = XET.fromstring(vix)
     if vi.find('opRet').text != '0':
         logging.info("Unable to get list of up nodes of %s, "
@@ -72,7 +102,7 @@ class Volinfo(object):
             else:
                 via = ' '
             raise GsyncdError('getting volume info of %s%s '
-                              'failed with errorcode %s',
+                              'failed with errorcode %s' %
                               (vol, via, vi.find('opErrno').text))
         self.tree = vi
         self.volume = vol
@@ -80,6 +110,13 @@ class Volinfo(object):
 
     def get(self, elem):
         return self.tree.findall('.//' + elem)
+
+    def is_tier(self):
+        return (self.get('typeStr')[0].text == 'Tier')
+
+    def is_hot(self, brickpath):
+        logging.debug('brickpath: ' + repr(brickpath))
+        return brickpath in self.hot_bricks
 
     @property
     @memoize
@@ -95,9 +132,38 @@ class Volinfo(object):
         ids = self.get('id')
         if len(ids) != 1:
             raise GsyncdError("volume info of %s obtained from %s: "
-                              "ambiguous uuid",
-                              self.volume, self.host)
+                              "ambiguous uuid" % (self.volume, self.host))
         return ids[0].text
+
+    def replica_count(self, tier, hot):
+        if (tier and hot):
+            return int(self.get('hotBricks/hotreplicaCount')[0].text)
+        elif (tier and not hot):
+            return int(self.get('coldBricks/coldreplicaCount')[0].text)
+        else:
+            return int(self.get('replicaCount')[0].text)
+
+    def disperse_count(self, tier, hot):
+        if (tier and hot):
+            # Tiering doesn't support disperse volume as hot brick,
+            # hence no xml output, so returning 0. In case, if it's
+            # supported later, we should change here.
+            return 0
+        elif (tier and not hot):
+            return int(self.get('coldBricks/colddisperseCount')[0].text)
+        else:
+            return int(self.get('disperseCount')[0].text)
+
+    @property
+    @memoize
+    def hot_bricks(self):
+        return [b.text for b in self.get('hotBricks/brick')]
+
+    def get_hot_bricks_count(self, tier):
+        if (tier):
+            return int(self.get('hotBricks/hotbrickCount')[0].text)
+        else:
+            return 0
 
 
 class Monitor(object):
@@ -105,41 +171,16 @@ class Monitor(object):
     """class which spawns and manages gsyncd workers"""
 
     ST_INIT = 'Initializing...'
-    ST_STABLE = 'Stable'
-    ST_FAULTY = 'faulty'
+    ST_STARTED = 'Started'
+    ST_STABLE = 'Active'
+    ST_FAULTY = 'Faulty'
     ST_INCON = 'inconsistent'
     _ST_ORD = [ST_STABLE, ST_INIT, ST_FAULTY, ST_INCON]
 
     def __init__(self):
         self.lock = Lock()
         self.state = {}
-
-    def set_state(self, state, w=None):
-        """set the state that can be used by external agents
-           like glusterd for status reporting"""
-        computestate = lambda: self.state and self._ST_ORD[
-            max(self._ST_ORD.index(s) for s in self.state.values())]
-        if w:
-            self.lock.acquire()
-            old_state = computestate()
-            self.state[w] = state
-            state = computestate()
-            self.lock.release()
-            if state != old_state:
-                self.set_state(state)
-        else:
-            if getattr(gconf, 'state_file', None):
-                # If previous state is paused, suffix the
-                # new state with '(Paused)'
-                try:
-                    with open(gconf.state_file, "r") as f:
-                        content = f.read()
-                        if "paused" in content.lower():
-                            state = state + '(Paused)'
-                except IOError:
-                    pass
-                logging.info('new state: %s' % state)
-                update_file(gconf.state_file, lambda f: f.write(state + '\n'))
+        self.status = {}
 
     @staticmethod
     def terminate():
@@ -147,9 +188,9 @@ class Monitor(object):
         # standard handler
         set_term_handler(lambda *a: set_term_handler())
         # give a chance to graceful exit
-        os.kill(-os.getpid(), signal.SIGTERM)
+        errno_wrap(os.kill, [-os.getpid(), signal.SIGTERM], [ESRCH])
 
-    def monitor(self, w, argv, cpids, agents, slave_vol, slave_host):
+    def monitor(self, w, argv, cpids, agents, slave_vol, slave_host, master):
         """the monitor loop
 
         Basic logic is a blantantly simple blunt heuristics:
@@ -168,16 +209,27 @@ class Monitor(object):
         blown worker blows up on EPIPE if the net goes down,
         due to the keep-alive thread)
         """
+        if not self.status.get(w[0], None):
+            self.status[w[0]] = GeorepStatus(gconf.state_file, w[0])
 
-        self.set_state(self.ST_INIT, w)
+        set_monitor_status(gconf.state_file, self.ST_STARTED)
+        self.status[w[0]].set_worker_status(self.ST_INIT)
 
         ret = 0
 
         def nwait(p, o=0):
-            p2, r = waitpid(p, o)
-            if not p2:
-                return
-            return r
+            try:
+                p2, r = waitpid(p, o)
+                if not p2:
+                    return
+                return r
+            except OSError as e:
+                # no child process, this happens if the child process
+                # already died and has been cleaned up
+                if e.errno == ECHILD:
+                    return -1
+                else:
+                    raise
 
         def exit_signalled(s):
             """ child teminated due to receipt of SIGUSR1 """
@@ -226,6 +278,8 @@ class Monitor(object):
             # spawn the agent process
             apid = os.fork()
             if apid == 0:
+                os.close(rw)
+                os.close(ww)
                 os.execv(sys.executable, argv + ['--local-path', w[0],
                                                  '--agent',
                                                  '--rpc-fd',
@@ -235,6 +289,8 @@ class Monitor(object):
             cpid = os.fork()
             if cpid == 0:
                 os.close(pr)
+                os.close(ra)
+                os.close(wa)
                 os.execv(sys.executable, argv + ['--feedback-fd', str(pw),
                                                  '--local-path', w[0],
                                                  '--local-id',
@@ -242,8 +298,9 @@ class Monitor(object):
                                                  '--rpc-fd',
                                                  ','.join([str(rw), str(ww),
                                                            str(ra), str(wa)]),
-                                                 '--resource-remote',
-                                                 remote_host])
+                                                 '--subvol-num', str(w[2])] +
+                         (['--is-hottier'] if w[3] else []) +
+                         ['--resource-remote', remote_host])
 
             cpids.add(cpid)
             agents.add(apid)
@@ -262,30 +319,52 @@ class Monitor(object):
 
             if so:
                 ret = nwait(cpid, os.WNOHANG)
+                ret_agent = nwait(apid, os.WNOHANG)
+
+                if ret_agent is not None:
+                    # Agent is died Kill Worker
+                    logging.info("Changelog Agent died, "
+                                 "Aborting Worker(%s)" % w[0])
+                    errno_wrap(os.kill, [cpid, signal.SIGKILL], [ESRCH])
+                    nwait(cpid)
+                    nwait(apid)
+
                 if ret is not None:
                     logging.info("worker(%s) died before establishing "
                                  "connection" % w[0])
-                    nwait(apid) #wait for agent
+                    nwait(apid)  # wait for agent
                 else:
                     logging.debug("worker(%s) connected" % w[0])
                     while time.time() < t0 + conn_timeout:
                         ret = nwait(cpid, os.WNOHANG)
+                        ret_agent = nwait(apid, os.WNOHANG)
+
                         if ret is not None:
                             logging.info("worker(%s) died in startup "
                                          "phase" % w[0])
-                            nwait(apid) #wait for agent
+                            nwait(apid)  # wait for agent
                             break
+
+                        if ret_agent is not None:
+                            # Agent is died Kill Worker
+                            logging.info("Changelog Agent died, Aborting "
+                                         "Worker(%s)" % w[0])
+                            errno_wrap(os.kill, [cpid, signal.SIGKILL], [ESRCH])
+                            nwait(cpid)
+                            nwait(apid)
+                            break
+
                         time.sleep(1)
             else:
                 logging.info("worker(%s) not confirmed in %d sec, "
                              "aborting it" % (w[0], conn_timeout))
-                os.kill(cpid, signal.SIGKILL)
-                nwait(apid) #wait for agent
+                errno_wrap(os.kill, [cpid, signal.SIGKILL], [ESRCH])
+                nwait(apid)  # wait for agent
                 ret = nwait(cpid)
             if ret is None:
-                self.set_state(self.ST_STABLE, w)
-                #If worker dies, agent terminates on EOF.
-                #So lets wait for agent first.
+                self.status[w[0]].set_worker_status(self.ST_STABLE)
+                # If worker dies, agent terminates on EOF.
+                # So lets wait for agent first.
                 nwait(apid)
                 ret = nwait(cpid)
             if exit_signalled(ret):
@@ -293,12 +372,12 @@ class Monitor(object):
             else:
                 ret = exit_status(ret)
                 if ret in (0, 1):
-                    self.set_state(self.ST_FAULTY, w)
+                    self.status[w[0]].set_worker_status(self.ST_FAULTY)
             time.sleep(10)
-        self.set_state(self.ST_INCON, w)
+        self.status[w[0]].set_worker_status(self.ST_INCON)
         return ret
 
-    def multiplex(self, wspx, suuid, slave_vol, slave_host):
+    def multiplex(self, wspx, suuid, slave_vol, slave_host, master):
         argv = sys.argv[:]
         for o in ('-N', '--no-daemon', '--monitor'):
             while o in argv:
@@ -312,13 +391,13 @@ class Monitor(object):
         for wx in wspx:
             def wmon(w):
                 cpid, _ = self.monitor(w, argv, cpids, agents, slave_vol,
-                                       slave_host)
+                                       slave_host, master)
                 time.sleep(1)
                 self.lock.acquire()
                 for cpid in cpids:
-                    os.kill(cpid, signal.SIGKILL)
+                    errno_wrap(os.kill, [cpid, signal.SIGKILL], [ESRCH])
                 for apid in agents:
-                    os.kill(apid, signal.SIGKILL)
+                    errno_wrap(os.kill, [apid, signal.SIGKILL], [ESRCH])
                 self.lock.release()
                 finalize(exval=1)
             t = Thread(target=wmon, args=[wx])
@@ -350,8 +429,17 @@ def distribute(*resources):
         suuid = svol.uuid
         slave_host = slave.remote_addr.split('@')[-1]
         slave_vol = si.volume
+
+        # save this xattr for the session delete command
+        old_stime_xattr_name = getattr(gconf, "master.stime_xattr_name", None)
+        new_stime_xattr_name = "trusted.glusterfs." + mvol.uuid + "." + \
+            svol.uuid + ".stime"
+        if not old_stime_xattr_name or \
+           old_stime_xattr_name != new_stime_xattr_name:
+            gconf.configinterface.set("master.stime_xattr_name",
+                                      new_stime_xattr_name)
     else:
-        raise GsyncdError("unkown slave type " + slave.url)
+        raise GsyncdError("unknown slave type " + slave.url)
     logging.info('slave bricks: ' + repr(sbricks))
     if isinstance(si, FILE):
         slaves = [slave.url]
@@ -369,11 +457,16 @@ def distribute(*resources):
             else:
                 slaves = slavevols
 
-    workerspex = [(brick['dir'], slaves[idx % len(slaves)])
-                  for idx, brick in enumerate(mvol.bricks)
-                  if is_host_local(brick['host'])]
+    workerspex = []
+    for idx, brick in enumerate(mvol.bricks):
+        if is_host_local(brick['host']):
+            is_hot = mvol.is_hot(":".join([brick['host'], brick['dir']]))
+            workerspex.append((brick['dir'],
+                               slaves[idx % len(slaves)],
+                               get_subvol_num(idx, mvol, is_hot),
+                               is_hot))
     logging.info('worker specs: ' + repr(workerspex))
-    return workerspex, suuid, slave_vol, slave_host
+    return workerspex, suuid, slave_vol, slave_host, master
 
 
 def monitor(*resources):
@@ -381,7 +474,7 @@ def monitor(*resources):
     # yes, send SIGSTOP to negative of monitor pid
     # to go back to pause state.
     if gconf.pause_on_start:
-        os.kill(-os.getpid(), signal.SIGSTOP)
+        errno_wrap(os.kill, [-os.getpid(), signal.SIGSTOP], [ESRCH])
 
     """oh yeah, actually Monitor is used as singleton, too"""
     return Monitor().multiplex(*distribute(*resources))

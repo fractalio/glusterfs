@@ -12,6 +12,17 @@ function check_readonly()
     return $?
 }
 
+function lookup()
+{
+    ls $1
+    if [ "$?" == "0" ]
+    then
+        echo "Y"
+    else
+        echo "N"
+    fi
+}
+
 cleanup;
 TESTS_EXPECTED_IN_LOOP=10
 
@@ -23,6 +34,8 @@ TEST glusterd;
 TEST pidof glusterd;
 
 TEST $CLI volume create $V0 $H0:$L1 $H0:$L2 $H0:$L3;
+TEST $CLI volume set $V0 nfs.disable false
+
 
 TEST $CLI volume start $V0;
 
@@ -30,13 +43,43 @@ TEST $GFS --volfile-server=$H0 --volfile-id=$V0 $M0;
 
 for i in {1..10} ; do echo "file" > $M0/file$i ; done
 
-TEST $CLI snapshot config activate-on-create enable
+# Create file and hard-links
+TEST touch $M0/f1
+TEST mkdir $M0/dir
+TEST ln $M0/f1 $M0/f2
+TEST ln $M0/f1 $M0/dir/f3
 
-TEST $CLI snapshot create snap1 $V0;
+TEST $CLI snapshot config activate-on-create enable
+TEST $CLI volume set $V0 features.uss enable;
+
+TEST $CLI snapshot create snap1 $V0 no-timestamp;
 
 for i in {11..20} ; do echo "file" > $M0/file$i ; done
 
-TEST $CLI snapshot create snap2 $V0;
+TEST $CLI snapshot create snap2 $V0 no-timestamp;
+
+########### Test inode numbers ###########
+s1_f1_ino=$(STAT_INO $M0/.snaps/snap1/f1)
+TEST [ $s1_f1_ino != 0 ]
+
+# Inode number of f1 should be same as f2 f3 within snapshot
+EXPECT $s1_f1_ino STAT_INO $M0/.snaps/snap1/f2
+EXPECT $s1_f1_ino STAT_INO $M0/.snaps/snap1/dir/f3
+EXPECT $s1_f1_ino STAT_INO $M0/dir/.snaps/snap1/f3
+
+# Inode number of f1 in snap1 should be different from f1 in snap2
+tmp_ino=$(STAT_INO $M0/.snaps/snap2/f1)
+TEST [ $s1_f1_ino != $tmp_ino ]
+
+# Inode number of f1 in snap1 should be different from f1 in regular volume
+tmp_ino=$(STAT_INO $M0/f1)
+TEST [ $s1_f1_ino != $tmp_ino ]
+
+# Directory inode of snap1 should be different in each sub-dir
+s1_ino=$(STAT_INO $M0/.snaps/snap1)
+tmp_ino=$(STAT_INO $M0/dir/.snaps/snap1)
+TEST [ $s1_ino != $tmp_ino ]
+##########################################
 
 mkdir $M0/dir1;
 mkdir $M0/dir2;
@@ -44,33 +87,41 @@ mkdir $M0/dir2;
 for i in {1..10} ; do echo "foo" > $M0/dir1/foo$i ; done
 for i in {1..10} ; do echo "foo" > $M0/dir2/foo$i ; done
 
-TEST $CLI snapshot create snap3 $V0;
+TEST $CLI snapshot create snap3 $V0 no-timestamp;
 
 for i in {11..20} ; do echo "foo" > $M0/dir1/foo$i ; done
 for i in {11..20} ; do echo "foo" > $M0/dir2/foo$i ; done
 
-TEST $CLI snapshot create snap4 $V0;
-
+TEST $CLI snapshot create snap4 $V0 no-timestamp;
 ## Test that features.uss takes only options enable/disable and throw error for
 ## any other argument.
 for i in {1..10}; do
-        RANDOM_STRING=`cat /dev/urandom | tr -dc 'a-zA-Z' | fold -w 8 | head -n 1`
+        RANDOM_STRING=$(uuidgen | tr -dc 'a-zA-Z' | head -c 8)
         TEST_IN_LOOP ! $CLI volume set $V0 features.uss $RANDOM_STRING
 done
 
-TEST $CLI volume set $V0 features.uss enable;
+## Test that features.snapshot-directory:
+##   contains only '0-9a-z-_'
+#    starts with dot (.)
+#    value cannot exceed 255 characters
+## and throws error for any other argument.
+TEST ! $CLI volume set $V0 features.snapshot-directory a/b
+TEST ! $CLI volume set $V0 features.snapshot-directory snaps
+TEST ! $CLI volume set $V0 features.snapshot-directory -a
+TEST ! $CLI volume set $V0 features.snapshot-directory .
+TEST ! $CLI volume set $V0 features.snapshot-directory ..
+TEST ! $CLI volume set $V0 features.snapshot-directory .123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345
 
 EXPECT_WITHIN $UMOUNT_TIMEOUT "Y" force_umount $M0
 
 TEST $GFS --volfile-server=$H0 --volfile-id=$V0 $M0;
 
 # test 15
-TEST ls $M0/.snaps;
+EXPECT_WITHIN $PROCESS_UP_TIMEOUT "4" count_snaps $M0
 
 NUM_SNAPS=$(ls $M0/.snaps | wc -l);
 
 TEST [ $NUM_SNAPS == 4 ]
-
 TEST ls $M0/.snaps/snap1;
 TEST ls $M0/.snaps/snap2;
 TEST ls $M0/.snaps/snap3;
@@ -179,7 +230,9 @@ TEST fd_close $fd3;
 # test 73
 TEST $CLI volume set $V0 "features.snapshot-directory" .history
 
-TEST ls $M0/.history;
+#snapd client might take fraction of time to compare the volfile from glusterd
+#hence a EXPECT_WITHIN is a better choice here
+EXPECT_WITHIN 2 "Y" lookup "$M0/.history";
 
 NUM_SNAPS=$(ls $M0/.history | wc -l);
 
@@ -277,7 +330,7 @@ TEST fd_close $fd3;
 EXPECT_WITHIN $UMOUNT_TIMEOUT "Y" umount_nfs $N0
 
 #test 131
-TEST $CLI snapshot create snap5 $V0
+TEST $CLI snapshot create snap5 $V0 no-timestamp
 TEST ls $M0/.history;
 
 function count_snaps
@@ -306,19 +359,19 @@ EXPECT_WITHIN 30 "5" count_snaps $M0;
 
 echo "aaa" > $M0/aaa;
 
-TEST $CLI snapshot create snap6 $V0
+TEST $CLI snapshot create snap6 $V0 no-timestamp
 
 TEST ls $M0/.history;
 
 EXPECT_WITHIN 30 "6" count_snaps $M0;
 
-TEST stat $M0/.history/snap6/aaa
+EXPECT_WITHIN 10 "Y" lookup $M0/.history/snap6/aaa
 
 TEST rm -f $M0/aaa;
 
 TEST $CLI snapshot delete snap6;
 
-TEST $CLI snapshot create snap6 $V0
+TEST $CLI snapshot create snap6 $V0 no-timestamp
 
 TEST ls $M0/.history;
 

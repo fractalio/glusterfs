@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2006-2012 Red Hat, Inc. <http://www.redhat.com>
+   Copyright (c) 2006-2012, 2015-2016 Red Hat, Inc. <http://www.redhat.com>
    This file is part of GlusterFS.
 
    This file is licensed to you under your choice of the GNU Lesser
@@ -35,7 +35,8 @@
 
 posix_lock_t *
 new_posix_lock (struct gf_flock *flock, client_t *client, pid_t client_pid,
-                gf_lkowner_t *owner, fd_t *fd);
+                gf_lkowner_t *owner, fd_t *fd, uint32_t lk_flags,
+                int can_block);
 
 pl_inode_t *
 pl_inode_get (xlator_t *this, inode_t *inode);
@@ -59,7 +60,7 @@ locks_overlap (posix_lock_t *l1, posix_lock_t *l2);
 int
 same_owner (posix_lock_t *l1, posix_lock_t *l2);
 
-void __delete_lock (pl_inode_t *, posix_lock_t *);
+void __delete_lock (posix_lock_t *);
 
 void __destroy_lock (posix_lock_t *);
 
@@ -149,10 +150,15 @@ pl_verify_reservelk (xlator_t *this, pl_inode_t *pl_inode,
 int
 pl_reserve_unlock (xlator_t *this, pl_inode_t *pl_inode, posix_lock_t *reqlock);
 
-uint32_t
+int32_t
 check_entrylk_on_basename (xlator_t *this, inode_t *parent, char *basename);
 
 void __pl_inodelk_unref (pl_inode_lock_t *lock);
 void __pl_entrylk_unref (pl_entry_lock_t *lock);
 
+int
+pl_metalock_is_active (pl_inode_t *pl_inode);
+
+int
+__pl_queue_lock (pl_inode_t *pl_inode, posix_lock_t *reqlock, int can_block);
 #endif /* __COMMON_H__ */

@@ -125,6 +125,7 @@ struct rpc_clnt_config {
         int    rpc_timeout;
         int    remote_port;
         char * remote_host;
+        int    ping_timeout;
 };
 
 
@@ -139,6 +140,7 @@ struct rpc_clnt_connection {
         gf_timer_t              *ping_timer;
         struct rpc_clnt         *rpc_clnt;
         char                     connected;
+        gf_boolean_t             disconnected;
         struct saved_frames     *saved_frames;
         int32_t                  frame_timeout;
 	struct timeval           last_sent;
@@ -187,9 +189,11 @@ typedef struct rpc_clnt {
         int                   refcount;
         int                   auth_null;
         char                  disabled;
+        xlator_t             *owner;
 } rpc_clnt_t;
 
-struct rpc_clnt *rpc_clnt_new (dict_t *options, glusterfs_ctx_t *ctx,
+
+struct rpc_clnt *rpc_clnt_new (dict_t *options, xlator_t *owner,
                                char *name, uint32_t reqpool_size);
 
 int rpc_clnt_start (struct rpc_clnt *rpc);
@@ -231,6 +235,9 @@ int rpc_clnt_connection_cleanup (rpc_clnt_connection_t *conn);
 void rpc_clnt_set_connected (rpc_clnt_connection_t *conn);
 
 void rpc_clnt_unset_connected (rpc_clnt_connection_t *conn);
+
+gf_boolean_t is_rpc_clnt_disconnected (rpc_clnt_connection_t *conn);
+
 void rpc_clnt_reconnect (void *trans_ptr);
 
 void rpc_clnt_reconfig (struct rpc_clnt *rpc, struct rpc_clnt_config *config);
@@ -243,6 +250,9 @@ int rpcclnt_cbk_program_register (struct rpc_clnt *svc,
 
 void
 rpc_clnt_disable (struct rpc_clnt *rpc);
+
+void
+rpc_clnt_disconnect (struct rpc_clnt *rpc);
 
 char
 rpc_clnt_is_disabled (struct rpc_clnt *rpc);

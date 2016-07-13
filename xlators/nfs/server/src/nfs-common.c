@@ -8,11 +8,6 @@
   cases as published by the Free Software Foundation.
 */
 
-#ifndef _CONFIG_H
-#define _CONFIG_H
-#include "config.h"
-#endif
-
 #include "rpcsvc.h"
 #include "dict.h"
 #include "xlator.h"
@@ -24,6 +19,7 @@
 #include "nfs-mem-types.h"
 #include "rpcsvc.h"
 #include "iatt.h"
+#include "nfs-messages.h"
 
 #include <libgen.h>
 
@@ -87,7 +83,7 @@ nfs_mntpath_to_xlator (xlator_list_t *cl, char *path)
 
         volname = strdupa (path);
         pathlen = strlen (volname);
-        gf_log (GF_NFS, GF_LOG_TRACE, "Subvolume search: %s", path);
+        gf_msg_trace (GF_NFS, 0, "Subvolume search: %s", path);
         if (volname[0] == '/')
                 volptr = &volname[1];
         else
@@ -107,25 +103,6 @@ nfs_mntpath_to_xlator (xlator_list_t *cl, char *path)
 
         return targetxl;
 
-}
-
-
-/* Returns 1 if the stat seems to be filled with zeroes. */
-int
-nfs_zero_filled_stat (struct iatt *buf)
-{
-        if (!buf)
-                return 1;
-
-        /* Do not use st_dev because it is transformed to store the xlator id
-         * in place of the device number. Do not use st_ino because by this time
-         * we've already mapped the root ino to 1 so it is not guaranteed to be
-         * 0.
-         */
-        if ((buf->ia_nlink == 0) && (buf->ia_ctime == 0))
-                return 1;
-
-        return 0;
 }
 
 
@@ -157,8 +134,8 @@ nfs_loc_fill (loc_t *loc, inode_t *inode, inode_t *parent, char *path)
 
         if (inode) {
                 loc->inode = inode_ref (inode);
-                if (!uuid_is_null (inode->gfid))
-                        uuid_copy (loc->gfid, inode->gfid);
+                if (!gf_uuid_is_null (inode->gfid))
+                        gf_uuid_copy (loc->gfid, inode->gfid);
         }
 
         if (parent)
@@ -167,7 +144,8 @@ nfs_loc_fill (loc_t *loc, inode_t *inode, inode_t *parent, char *path)
         if (path) {
                 loc->path = gf_strdup (path);
                 if (!loc->path) {
-                        gf_log (GF_NFS, GF_LOG_ERROR, "strdup failed");
+                        gf_msg (GF_NFS, GF_LOG_ERROR, ENOMEM,
+                                NFS_MSG_NO_MEMORY, "strdup failed");
                         goto loc_wipe;
                 }
                 loc->name = strrchr (loc->path, '/');
@@ -198,11 +176,12 @@ nfs_inode_loc_fill (inode_t *inode, loc_t *loc, int how)
          * the inode table, and not a newly created one. For newly
          * created inode, inode_path returns null gfid as the path.
          */
-        if (!uuid_is_null (inode->gfid)) {
+        if (!gf_uuid_is_null (inode->gfid)) {
                 ret = inode_path (inode, NULL, &resolvedpath);
                 if (ret < 0) {
-                        gf_log (GF_NFS, GF_LOG_ERROR, "path resolution failed "
-                                "%s", resolvedpath);
+                        gf_msg (GF_NFS, GF_LOG_ERROR, 0,
+                                NFS_MSG_PATH_RESOLVE_FAIL, "path resolution "
+                                "failed %s", resolvedpath);
                         goto err;
                 }
         }
@@ -218,8 +197,9 @@ nfs_inode_loc_fill (inode_t *inode, loc_t *loc, int how)
 
         ret = nfs_loc_fill (loc, inode, parent, resolvedpath);
         if (ret < 0) {
-                gf_log (GF_NFS, GF_LOG_ERROR, "loc fill resolution failed %s",
-                                resolvedpath);
+                gf_msg (GF_NFS, GF_LOG_ERROR, -ret,
+                        NFS_MSG_LOC_FILL_RESOLVE_FAIL,
+                        "loc fill resolution failed %s", resolvedpath);
                 goto err;
         }
 
@@ -244,31 +224,37 @@ nfs_gfid_loc_fill (inode_table_t *itable, uuid_t gfid, loc_t *loc, int how)
 
         inode = inode_find (itable, gfid);
         if (!inode) {
-		gf_log (GF_NFS, GF_LOG_TRACE, "Inode not found in itable, will try to create one.");
+		gf_msg_trace (GF_NFS, 0, "Inode not found in itable, will "
+                              "try to create one.");
                 if (how == NFS_RESOLVE_CREATE) {
-			gf_log (GF_NFS, GF_LOG_TRACE, "Inode needs to be created.");
+			gf_msg_trace (GF_NFS, 0, "Inode needs to be created.");
                         inode = inode_new (itable);
                         if (!inode) {
-                                gf_log (GF_NFS, GF_LOG_ERROR, "Failed to "
+                                gf_msg (GF_NFS, GF_LOG_ERROR, ENOMEM,
+                                        NFS_MSG_NO_MEMORY, "Failed to "
                                         "allocate memory");
                                 ret = -ENOMEM;
                                 goto err;
                         }
 
                 } else {
-			gf_log (GF_NFS, GF_LOG_ERROR, "Inode not found in itable and no creation was requested.");
+			gf_msg (GF_NFS, GF_LOG_ERROR, ENOENT,
+                                NFS_MSG_INODE_NOT_FOUND, "Inode not found in "
+                                "itable and no creation was requested.");
                         ret = -ENOENT;
                         goto err;
                 }
         } else {
-		gf_log (GF_NFS, GF_LOG_TRACE, "Inode was found in the itable.");
+		gf_msg_trace (GF_NFS, 0, "Inode was found in the itable.");
 	}
 
-        uuid_copy (loc->gfid, gfid);
+        gf_uuid_copy (loc->gfid, gfid);
 
         ret = nfs_inode_loc_fill (inode, loc, how);
 	if (ret < 0) {
-		gf_log (GF_NFS, GF_LOG_ERROR, "Inode loc filling failed.: %s", strerror (-ret));
+		gf_msg (GF_NFS, GF_LOG_ERROR, -ret,
+                        NFS_MSG_INODE_LOC_FILL_ERROR,
+                        "Inode loc filling failed.: %s", strerror (-ret));
 		goto err;
 	}
 
@@ -302,8 +288,8 @@ nfs_parent_inode_loc_fill (inode_t *parent, inode_t *entryinode, char *entry,
 
         ret = inode_path (parent, entry, &path);
         if (ret < 0) {
-                gf_log (GF_NFS, GF_LOG_ERROR, "path resolution failed %s",
-                                path);
+                gf_msg (GF_NFS, GF_LOG_ERROR, -ret, NFS_MSG_PATH_RESOLVE_FAIL,
+                        "path resolution failed %s", path);
                 goto err;
         }
 
@@ -321,8 +307,8 @@ err:
  * On other errors, return -3. 0 on success.
  */
 int
-nfs_entry_loc_fill (inode_table_t *itable, uuid_t pargfid, char *entry,
-                    loc_t *loc, int how)
+nfs_entry_loc_fill (xlator_t *this, inode_table_t *itable, uuid_t pargfid,
+                    char *entry, loc_t *loc, int how)
 {
         inode_t         *parent = NULL;
         inode_t         *entryinode = NULL;
@@ -337,21 +323,22 @@ nfs_entry_loc_fill (inode_table_t *itable, uuid_t pargfid, char *entry,
 
         ret = -1;
         /* Will need hard resolution now */
-        if (!parent)
+        if (!parent || inode_ctx_get (parent, this, NULL))
                 goto err;
 
-        uuid_copy (loc->pargfid, pargfid);
+        gf_uuid_copy (loc->pargfid, pargfid);
 
         ret = -2;
         entryinode = inode_grep (itable, parent, entry);
-        if (!entryinode) {
+        if (!entryinode || inode_ctx_get (entryinode, this, NULL)) {
                 if (how == NFS_RESOLVE_CREATE) {
                         /* Even though we'll create the inode and the loc for
                          * a missing inode, we still need to return -2 so
                          * that the caller can use the filled loc to call
                          * lookup.
                          */
-                        entryinode = inode_new (itable);
+                        if (!entryinode)
+                                entryinode = inode_new (itable);
                         /* Cannot change ret because that must
                          * continue to have -2.
                          */
@@ -369,16 +356,16 @@ nfs_entry_loc_fill (inode_table_t *itable, uuid_t pargfid, char *entry,
 
         ret = inode_path (parent, entry, &resolvedpath);
         if (ret < 0) {
-                gf_log (GF_NFS, GF_LOG_ERROR, "path resolution failed %s",
-                                resolvedpath);
+                gf_msg (GF_NFS, GF_LOG_ERROR, -ret, NFS_MSG_PATH_RESOLVE_FAIL,
+                        "path resolution failed %s", resolvedpath);
                 ret = -3;
                 goto err;
         }
 
         ret = nfs_loc_fill (loc, entryinode, parent, resolvedpath);
         if (ret < 0) {
-                gf_log (GF_NFS, GF_LOG_ERROR, "loc_fill failed %s",
-                                resolvedpath);
+                gf_msg (GF_NFS, GF_LOG_ERROR, 0, NFS_MSG_INODE_LOC_FILL_ERROR,
+                        "loc_fill failed %s", resolvedpath);
                 ret = -3;
         }
 
@@ -449,7 +436,8 @@ nfs_fix_generation (xlator_t *this, inode_t *inode)
                 ictx = GF_CALLOC (1, sizeof (struct nfs_inode_ctx),
                                   gf_nfs_mt_inode_ctx);
                 if (!ictx) {
-                        gf_log (this->name, GF_LOG_ERROR,
+                        gf_msg (this->name, GF_LOG_ERROR, ENOMEM,
+                                NFS_MSG_NO_MEMORY,
                                 "could not allocate nfs inode ctx");
                         return;
                 }
@@ -457,7 +445,8 @@ nfs_fix_generation (xlator_t *this, inode_t *inode)
                 ictx->generation = priv->generation;
                 ret = inode_ctx_put (inode, this, (uint64_t)ictx);
                 if (ret) {
-                        gf_log (this->name, GF_LOG_ERROR,
+                        gf_msg (this->name, GF_LOG_ERROR, 0,
+                                NFS_MSG_INODE_CTX_STORE_FAIL,
                                 "could not store nfs inode ctx");
                         return;
                 }

@@ -8,39 +8,269 @@
   cases as published by the Free Software Foundation.
 */
 
-#ifndef _CONFIG_H
-#define _CONFIG_H
-#include "config.h"
-#endif
-
 
 #include "glusterfs.h"
 #include "xlator.h"
 #include "dht-common.h"
 #include "dht-helper.h"
 
-static inline int
-dht_inode_ctx_set1 (xlator_t *this, inode_t *inode, xlator_t *subvol)
-{
-        uint64_t tmp_subvol = 0;
 
-        tmp_subvol = (long)subvol;
-        return inode_ctx_set1 (inode, this, &tmp_subvol);
+void
+dht_free_fd_ctx (void *data)
+{
+        dht_fd_ctx_t *fd_ctx = NULL;
+
+        fd_ctx = (dht_fd_ctx_t *)data;
+        GF_FREE (fd_ctx);
+
+        return;
 }
 
-int
-dht_inode_ctx_get1 (xlator_t *this, inode_t *inode, xlator_t **subvol)
+
+int32_t
+dht_fd_ctx_destroy (xlator_t *this, fd_t *fd)
 {
-        int ret = -1;
-        uint64_t tmp_subvol = 0;
+        dht_fd_ctx_t *fd_ctx  = NULL;
+        uint64_t      value   = 0;
+        int32_t       ret     = -1;
 
-        ret =  inode_ctx_get1 (inode, this, &tmp_subvol);
-        if (tmp_subvol && subvol)
-                *subvol = (xlator_t *)tmp_subvol;
+        GF_VALIDATE_OR_GOTO ("dht", this, out);
+        GF_VALIDATE_OR_GOTO (this->name, fd, out);
 
+        ret = fd_ctx_del (fd, this, &value);
+        if (ret) {
+                goto out;
+        }
+
+        fd_ctx = (dht_fd_ctx_t *)value;
+        if (fd_ctx) {
+                GF_REF_PUT (fd_ctx);
+        }
+out:
         return ret;
 }
 
+
+static int
+__dht_fd_ctx_set (xlator_t *this, fd_t *fd, xlator_t *dst)
+{
+        dht_fd_ctx_t *fd_ctx  = NULL;
+        uint64_t      value   = 0;
+        int           ret     = -1;
+
+        GF_VALIDATE_OR_GOTO ("dht", this, out);
+        GF_VALIDATE_OR_GOTO (this->name, fd, out);
+
+        fd_ctx = GF_CALLOC (1, sizeof (*fd_ctx), gf_dht_mt_fd_ctx_t);
+
+        if (!fd_ctx) {
+                goto out;
+        }
+
+        fd_ctx->opened_on_dst = (uint64_t) dst;
+        GF_REF_INIT (fd_ctx, dht_free_fd_ctx);
+
+        value = (uint64_t) fd_ctx;
+
+        ret = __fd_ctx_set (fd, this, value);
+        if (ret < 0) {
+                gf_msg (this->name, GF_LOG_WARNING, 0,
+                        DHT_MSG_FD_CTX_SET_FAILED,
+                        "Failed to set fd ctx in fd=0x%p", fd);
+                GF_REF_PUT (fd_ctx);
+        }
+out:
+        return ret;
+}
+
+
+
+int
+dht_fd_ctx_set (xlator_t *this, fd_t *fd, xlator_t *dst)
+{
+        dht_fd_ctx_t *fd_ctx  = NULL;
+        uint64_t      value   = 0;
+        int           ret     = -1;
+
+        GF_VALIDATE_OR_GOTO ("dht", this, out);
+        GF_VALIDATE_OR_GOTO (this->name, fd, out);
+
+        LOCK (&fd->lock);
+        {
+                ret = __fd_ctx_get (fd, this, &value);
+                if (ret && value) {
+
+                        fd_ctx = (dht_fd_ctx_t *) value;
+                        if (fd_ctx->opened_on_dst == (uint64_t) dst)  {
+                                /* This could happen due to racing
+                                 * check_progress tasks*/
+                                goto unlock;
+                        } else {
+                                /* This would be a big problem*/
+                                gf_msg (this->name, GF_LOG_WARNING, 0,
+                                        DHT_MSG_INVALID_VALUE,
+                                        "Different dst found in the fd ctx");
+
+                                /* Overwrite and hope for the best*/
+                                fd_ctx->opened_on_dst = (uint64_t)dst;
+                                goto unlock;
+                        }
+
+                }
+                ret = __dht_fd_ctx_set (this, fd, dst);
+        }
+unlock:
+        UNLOCK (&fd->lock);
+out:
+        return ret;
+}
+
+
+
+static
+dht_fd_ctx_t *
+dht_fd_ctx_get (xlator_t *this, fd_t *fd)
+{
+        dht_fd_ctx_t *fd_ctx  = NULL;
+        int           ret     = -1;
+        uint64_t      tmp_val = 0;
+
+        GF_VALIDATE_OR_GOTO ("dht", this, out);
+        GF_VALIDATE_OR_GOTO (this->name, fd, out);
+
+        LOCK (&fd->lock);
+        {
+                ret = __fd_ctx_get (fd, this, &tmp_val);
+                if ((ret < 0) || (tmp_val == 0)) {
+                        UNLOCK (&fd->lock);
+                        goto out;
+                }
+
+                fd_ctx = (dht_fd_ctx_t *)tmp_val;
+                GF_REF_GET (fd_ctx);
+        }
+        UNLOCK (&fd->lock);
+
+out:
+        return fd_ctx;
+}
+
+gf_boolean_t
+dht_fd_open_on_dst (xlator_t *this, fd_t *fd, xlator_t *dst)
+{
+        dht_fd_ctx_t  *fd_ctx  = NULL;
+        gf_boolean_t   opened  = _gf_false;
+
+        fd_ctx = dht_fd_ctx_get (this, fd);
+
+        if (fd_ctx) {
+                if (fd_ctx->opened_on_dst == (uint64_t) dst) {
+                        opened = _gf_true;
+                }
+                GF_REF_PUT (fd_ctx);
+        }
+
+        return opened;
+}
+
+
+void
+dht_free_mig_info (void *data)
+{
+        dht_migrate_info_t *miginfo = NULL;
+
+        miginfo = data;
+        GF_FREE (miginfo);
+
+        return;
+}
+
+static int
+dht_inode_ctx_set_mig_info (xlator_t *this, inode_t *inode,
+                            xlator_t *src_subvol, xlator_t *dst_subvol)
+{
+        dht_migrate_info_t *miginfo = NULL;
+        uint64_t            value   = 0;
+        int                 ret     = -1;
+
+        miginfo = GF_CALLOC (1, sizeof (*miginfo), gf_dht_mt_miginfo_t);
+        if (miginfo == NULL)
+                goto out;
+
+        miginfo->src_subvol = src_subvol;
+        miginfo->dst_subvol = dst_subvol;
+        GF_REF_INIT (miginfo, dht_free_mig_info);
+
+        value = (uint64_t) miginfo;
+
+        ret = inode_ctx_set1 (inode, this, &value);
+        if (ret < 0) {
+                GF_REF_PUT (miginfo);
+        }
+
+out:
+        return ret;
+}
+
+
+int
+dht_inode_ctx_get_mig_info (xlator_t *this, inode_t *inode,
+                            xlator_t **src_subvol, xlator_t **dst_subvol)
+{
+        int                 ret         = -1;
+        uint64_t            tmp_miginfo = 0;
+        dht_migrate_info_t *miginfo     = NULL;
+
+        LOCK (&inode->lock);
+        {
+                ret =  __inode_ctx_get1 (inode, this, &tmp_miginfo);
+                if ((ret < 0) || (tmp_miginfo == 0)) {
+                        UNLOCK (&inode->lock);
+                        goto out;
+                }
+
+                miginfo = (dht_migrate_info_t *)tmp_miginfo;
+                GF_REF_GET (miginfo);
+        }
+        UNLOCK (&inode->lock);
+
+        if (src_subvol)
+                *src_subvol = miginfo->src_subvol;
+
+        if (dst_subvol)
+                *dst_subvol = miginfo->dst_subvol;
+
+        GF_REF_PUT (miginfo);
+
+out:
+        return ret;
+}
+
+gf_boolean_t
+dht_mig_info_is_invalid (xlator_t *current, xlator_t *src_subvol,
+                      xlator_t *dst_subvol)
+{
+
+/* Not set
+ */
+        if (!src_subvol || !dst_subvol)
+                return _gf_true;
+
+/* Invalid scenarios:
+ * The src_subvol does not match the subvol on which the current op was sent
+ * so the cached subvol has changed between the last mig_info_set and now.
+ * src_subvol == dst_subvol. The file was migrated without any FOP detecting
+ * a P2 so the old dst is now the current subvol.
+ *
+ * There is still one scenario where the info could be outdated - if
+ * file has undergone multiple migrations and ends up on the same src_subvol
+ * on which the mig_info was first set.
+ */
+        if ((current == dst_subvol) || (current != src_subvol))
+                return _gf_true;
+
+        return _gf_false;
+}
 
 int
 dht_frame_return (call_frame_t *frame)
@@ -62,91 +292,6 @@ dht_frame_return (call_frame_t *frame)
         return this_call_cnt;
 }
 
-
-static uint64_t
-dht_bits_for (uint64_t num)
-{
-	uint64_t bits = 0, ctrl = 1;
-
-	while (ctrl < num) {
-		ctrl *= 2;
-		bits ++;
-	}
-
-	return bits;
-}
-
-/*
- * A slightly "updated" version of the algorithm described in the commit log
- * is used here.
- *
- * The only enhancement is that:
- *
- * - The number of bits used by the backend filesystem for HUGE d_off which
- *   is described as 63, and
- * - The number of bits used by the d_off presented by the transformation
- *   upwards which is described as 64, are both made "configurable."
- */
-
-
-#define BACKEND_D_OFF_BITS 63
-#define PRESENT_D_OFF_BITS 63
-
-#define ONE 1ULL
-#define MASK (~0ULL)
-#define PRESENT_MASK (MASK >> (64 - PRESENT_D_OFF_BITS))
-#define BACKEND_MASK (MASK >> (64 - BACKEND_D_OFF_BITS))
-
-#define TOP_BIT (ONE << (PRESENT_D_OFF_BITS - 1))
-#define SHIFT_BITS (max (0, (BACKEND_D_OFF_BITS - PRESENT_D_OFF_BITS + 1)))
-
-int
-dht_itransform (xlator_t *this, xlator_t *subvol, uint64_t x, uint64_t *y_p)
-{
-        dht_conf_t *conf = NULL;
-        int         cnt = 0;
-        int         max = 0;
-        uint64_t    y = 0;
-        uint64_t    hi_mask = 0;
-        uint64_t    off_mask = 0;
-        int         max_bits = 0;
-
-        if (x == ((uint64_t) -1)) {
-                y = (uint64_t) -1;
-                goto out;
-        }
-
-        conf = this->private;
-        if (!conf)
-                goto out;
-
-        max = conf->subvolume_cnt;
-        cnt = dht_subvol_cnt (this, subvol);
-
-	if (max == 1) {
-		y = x;
-		goto out;
-	}
-
-        max_bits = dht_bits_for (max);
-
-        hi_mask = ~(PRESENT_MASK >> (max_bits + 1));
-
-        if (x & hi_mask) {
-                /* HUGE d_off */
-                off_mask = MASK << max_bits;
-                y = TOP_BIT | ((x >> SHIFT_BITS) & off_mask) | cnt;
-        } else {
-                /* small d_off */
-                y = ((x * max) + cnt);
-        }
-
-out:
-        if (y_p)
-                *y_p = y;
-
-        return 0;
-}
 
 int
 dht_filter_loc_subvol_key (xlator_t *this, loc_t *loc, loc_t *new_loc,
@@ -205,54 +350,43 @@ out:
         return ret;
 }
 
-int
-dht_deitransform (xlator_t *this, uint64_t y, xlator_t **subvol_p,
-                  uint64_t *x_p)
+static xlator_t *
+dht_get_subvol_from_id(xlator_t *this, int client_id)
 {
+        xlator_t *xl = NULL;
         dht_conf_t *conf = NULL;
-        int         cnt = 0;
-        int         max = 0;
-        uint64_t    x = 0;
+        char sid[6] = { 0 };
+
+        conf = this->private;
+
+        sprintf(sid, "%d", client_id);
+        if (dict_get_ptr(conf->leaf_to_subvol, sid, (void **) &xl))
+                xl = NULL;
+
+        return xl;
+}
+
+int
+dht_deitransform (xlator_t *this, uint64_t y, xlator_t **subvol_p)
+{
+        int         client_id = 0;
         xlator_t   *subvol = 0;
-        int         max_bits = 0;
-        uint64_t    off_mask = 0;
-        uint64_t    host_mask = 0;
+        dht_conf_t *conf = NULL;
 
         if (!this->private)
                 return -1;
 
         conf = this->private;
-        max = conf->subvolume_cnt;
 
-	if (max == 1) {
-		x = y;
-		cnt = 0;
-		goto out;
-	}
+        client_id = gf_deitransform(this, y);
 
-        if (y & TOP_BIT) {
-                /* HUGE d_off */
-                max_bits = dht_bits_for (max);
-                off_mask = (MASK << max_bits);
-                host_mask = ~(off_mask);
+        subvol = dht_get_subvol_from_id(this, client_id);
 
-                x = ((y & ~TOP_BIT) & off_mask) << SHIFT_BITS;
-
-                cnt = y & host_mask;
-	} else {
-                /* small d_off */
-                cnt = y % max;
-                x = y / max;
-        }
-
-out:
-        subvol = conf->subvolumes[cnt];
+        if (!subvol)
+                subvol = conf->subvolumes[0];
 
         if (subvol_p)
                 *subvol_p = subvol;
-
-        if (x_p)
-                *x_p = x;
 
         return 0;
 }
@@ -286,7 +420,8 @@ dht_log_lk_array (char *name, gf_loglevel_t log_level, dht_lock_t **lk_array,
 
         for (i = 0; i < count; i++) {
                 lk_buf = dht_lock_asprintf (lk_array[i]);
-                gf_log (name, log_level, "%d. %s", i, lk_buf);
+                gf_msg (name, log_level, 0, DHT_MSG_LK_ARRAY_INFO,
+                        "%d. %s", i, lk_buf);
                 GF_FREE (lk_buf);
         }
 
@@ -356,6 +491,7 @@ dht_lock_new (xlator_t *this, xlator_t *xl, loc_t *loc, short type,
 
         lock->xl = xl;
         lock->type = type;
+
         lock->domain = gf_strdup (domain);
         if (lock->domain == NULL) {
                 dht_lock_free (lock);
@@ -462,6 +598,11 @@ dht_local_wipe (xlator_t *this, dht_local_t *local)
                 local->selfheal.layout = NULL;
         }
 
+        if (local->selfheal.refreshed_layout) {
+                dht_layout_unref (this, local->selfheal.refreshed_layout);
+                local->selfheal.refreshed_layout = NULL;
+        }
+
         dht_lock_array_free (local->lock.locks, local->lock.lk_count);
         GF_FREE (local->lock.locks);
 
@@ -469,10 +610,21 @@ dht_local_wipe (xlator_t *this, dht_local_t *local)
 
         GF_FREE (local->key);
 
+        if (local->rebalance.xdata)
+                dict_unref (local->rebalance.xdata);
+
+        if (local->rebalance.xattr)
+                dict_unref (local->rebalance.xattr);
+
         GF_FREE (local->rebalance.vector);
 
         if (local->rebalance.iobref)
                 iobref_unref (local->rebalance.iobref);
+
+        if (local->stub) {
+                call_stub_destroy (local->stub);
+                local->stub = NULL;
+        }
 
         mem_put (local);
 }
@@ -587,9 +739,16 @@ dht_subvol_get_hashed (xlator_t *this, loc_t *loc)
 {
         dht_layout_t *layout = NULL;
         xlator_t     *subvol = NULL;
+        dht_conf_t *conf = NULL;
+        dht_methods_t *methods = NULL;
 
         GF_VALIDATE_OR_GOTO ("dht", this, out);
         GF_VALIDATE_OR_GOTO (this->name, loc, out);
+
+        conf = this->private;
+        GF_VALIDATE_OR_GOTO (this->name, conf, out);
+
+        methods = &(conf->methods);
 
         if (__is_root_gfid (loc->gfid)) {
                 subvol = dht_first_up_subvol (this);
@@ -608,7 +767,7 @@ dht_subvol_get_hashed (xlator_t *this, loc_t *loc)
                 goto out;
         }
 
-        subvol = dht_layout_search (this, layout, loc->name);
+        subvol = methods->layout_search (this, layout, loc->name);
 
         if (!subvol) {
                 gf_msg_debug (this->name, 0,
@@ -751,7 +910,7 @@ dht_iatt_merge (xlator_t *this, struct iatt *to,
 
         to->ia_dev      = from->ia_dev;
 
-        uuid_copy (to->ia_gfid, from->ia_gfid);
+        gf_uuid_copy (to->ia_gfid, from->ia_gfid);
 
         to->ia_ino      = from->ia_ino;
         to->ia_prot     = from->ia_prot;
@@ -762,6 +921,10 @@ dht_iatt_merge (xlator_t *this, struct iatt *to,
         to->ia_blksize  = from->ia_blksize;
         to->ia_blocks  += from->ia_blocks;
 
+        if (IA_ISDIR (from->ia_type)) {
+                to->ia_blocks = DHT_DIR_STAT_BLOCKS;
+                to->ia_size = DHT_DIR_STAT_SIZE;
+        }
         set_if_greater (to->ia_uid, from->ia_uid);
         set_if_greater (to->ia_gid, from->ia_gid);
 
@@ -808,7 +971,28 @@ err:
         return -1;
 }
 
+int
+dht_init_local_subvolumes (xlator_t *this, dht_conf_t *conf)
+{
+        xlator_list_t *subvols = NULL;
+        int            cnt = 0;
 
+        if (!conf)
+                return -1;
+
+        for (subvols = this->children; subvols; subvols = subvols->next)
+                cnt++;
+
+        conf->local_subvols = GF_CALLOC (cnt, sizeof (xlator_t *),
+                                        gf_dht_mt_xlator_t);
+        if (!conf->local_subvols) {
+                return -1;
+        }
+
+        conf->local_subvols_cnt = 0;
+
+        return 0;
+}
 
 int
 dht_init_subvolumes (xlator_t *this, dht_conf_t *conf)
@@ -828,6 +1012,10 @@ dht_init_subvolumes (xlator_t *this, dht_conf_t *conf)
                 return -1;
         }
         conf->subvolume_cnt = cnt;
+
+        conf->local_subvols_cnt = 0;
+
+        dht_set_subvol_range(this);
 
         cnt = 0;
         for (subvols = this->children; subvols; subvols = subvols->next)
@@ -867,16 +1055,33 @@ dht_init_subvolumes (xlator_t *this, dht_conf_t *conf)
 }
 
 
-
+/*
+ op_ret values :
+  0 : Success.
+ -1 : Failure.
+  1 : File is being migrated but not by this DHT layer.
+*/
 
 static int
 dht_migration_complete_check_done (int op_ret, call_frame_t *frame, void *data)
 {
-        dht_local_t *local = NULL;
+        dht_local_t *local  = NULL;
+        xlator_t    *subvol = NULL;
 
         local = frame->local;
 
-        local->rebalance.target_op_fn (THIS, frame, op_ret);
+        if (op_ret != 0)
+                goto out;
+
+        if (local->cached_subvol == NULL) {
+                local->op_errno = EINVAL;
+                goto out;
+        }
+
+        subvol = local->cached_subvol;
+
+out:
+        local->rebalance.target_op_fn (THIS, subvol, frame, op_ret);
 
         return 0;
 }
@@ -885,22 +1090,23 @@ dht_migration_complete_check_done (int op_ret, call_frame_t *frame, void *data)
 int
 dht_migration_complete_check_task (void *data)
 {
-        int           ret      = -1;
-        xlator_t     *src_node = NULL;
-        xlator_t     *dst_node = NULL;
-        dht_local_t  *local    = NULL;
-        dict_t       *dict     = NULL;
-        dht_layout_t *layout   = NULL;
-        struct iatt   stbuf    = {0,};
-        xlator_t     *this     = NULL;
-        call_frame_t *frame    = NULL;
-        loc_t         tmp_loc  = {0,};
-        char         *path     = NULL;
-        dht_conf_t   *conf     = NULL;
-        inode_t      *inode    = NULL;
-        fd_t         *iter_fd  = NULL;
-        uint64_t      tmp_subvol = 0;
-        int           open_failed = 0;
+        int                 ret         = -1;
+        xlator_t           *src_node    = NULL;
+        xlator_t           *dst_node    = NULL, *linkto_target = NULL;
+        dht_local_t        *local       = NULL;
+        dict_t             *dict        = NULL;
+        struct iatt         stbuf       = {0,};
+        xlator_t           *this        = NULL;
+        call_frame_t       *frame       = NULL;
+        loc_t               tmp_loc     = {0,};
+        char               *path        = NULL;
+        dht_conf_t         *conf        = NULL;
+        inode_t            *inode       = NULL;
+        fd_t               *iter_fd     = NULL;
+        fd_t               *tmp         = NULL;
+        uint64_t            tmp_miginfo = 0;
+        dht_migrate_info_t *miginfo     = NULL;
+        int                 open_failed = 0;
 
         this  = THIS;
         frame = data;
@@ -921,158 +1127,189 @@ dht_migration_complete_check_task (void *data)
 
         if (!local->loc.inode) {
                 ret = syncop_fgetxattr (src_node, local->fd, &dict,
-                                        conf->link_xattr_name);
+                                        conf->link_xattr_name, NULL, NULL);
         } else {
                 SYNCTASK_SETID (0, 0);
                 ret = syncop_getxattr (src_node, &local->loc, &dict,
-                                       conf->link_xattr_name);
+                                       conf->link_xattr_name, NULL, NULL);
                 SYNCTASK_SETID (frame->root->uid, frame->root->gid);
         }
 
-        if (!ret)
-                dst_node = dht_linkfile_subvol (this, NULL, NULL, dict);
 
-        if (ret) {
-                if (!dht_inode_missing(-ret) || (!local->loc.inode)) {
-                        local->op_errno = -ret;
-                        gf_log (this->name, GF_LOG_ERROR,
-                                "%s: failed to get the 'linkto' xattr %s",
-                                local->loc.path, strerror (-ret));
-                        ret = -1;
-                        goto out;
+        /*
+         * Each DHT xlator layer has its own name for the linkto xattr.
+         * If the file mode bits indicate the the file is being migrated but
+         * this layer's linkto xattr is not set, it means that another
+         * DHT layer is migrating the file. In this case, return 1 so
+         * the mode bits can be passed on to the higher layer for appropriate
+         * action.
+         */
+        if (-ret == ENODATA) {
+                /* This DHT translator is not migrating this file */
+
+                ret = inode_ctx_reset1 (inode, this, &tmp_miginfo);
+                if (tmp_miginfo) {
+
+                        /* This can be a problem if the file was
+                         * migrated by two different layers. Raise
+                         * a warning here.
+                         */
+                        gf_msg (this->name, GF_LOG_WARNING, 0,
+                                DHT_MSG_HAS_MIGINFO,
+                                "%s: Found miginfo in the inode ctx",
+                                tmp_loc.path ? tmp_loc.path :
+                                uuid_utoa (tmp_loc.gfid));
+
+                        miginfo = (void *)tmp_miginfo;
+                        GF_REF_PUT (miginfo);
                 }
-
-                /* Need to do lookup on hashed subvol, then get the file */
-                ret = syncop_lookup (this, &local->loc, NULL, &stbuf, NULL,
-                                     NULL);
-                if (ret) {
-                        local->op_errno = -ret;
-                        ret = -1;
-                        goto out;
-                }
-
-                dst_node = dht_subvol_get_cached (this, local->loc.inode);
-        }
-
-        if (!dst_node) {
-                gf_log (this->name, GF_LOG_ERROR,
-                        "%s: failed to get the destination node",
-                        local->loc.path);
-                ret = -1;
-                local->op_errno = EINVAL;
+                ret = 1;
                 goto out;
         }
 
-        /* lookup on dst */
+        if (!ret)
+                linkto_target = dht_linkfile_subvol (this, NULL, NULL, dict);
+
         if (local->loc.inode) {
-                ret = syncop_lookup (dst_node, &local->loc, NULL, &stbuf, NULL,
-                                     NULL);
+                loc_copy (&tmp_loc, &local->loc);
+        } else {
+                tmp_loc.inode = inode_ref (inode);
+                gf_uuid_copy (tmp_loc.gfid, inode->gfid);
+        }
 
-                if (ret) {
-                        gf_log (this->name, GF_LOG_ERROR,
-                                "%s: failed to lookup the file on %s",
-                                local->loc.path, dst_node->name);
-                        local->op_errno = -ret;
-                        ret = -1;
-                        goto out;
-                }
+        ret = syncop_lookup (this, &tmp_loc, &stbuf, 0, 0, 0);
+        if (ret) {
+                gf_msg (this->name, GF_LOG_ERROR, -ret,
+                        DHT_MSG_FILE_LOOKUP_FAILED,
+                        "%s: failed to lookup the file on %s",
+                        tmp_loc.path ? tmp_loc.path : uuid_utoa (tmp_loc.gfid),
+                        this->name);
+                local->op_errno = -ret;
+                ret = -1;
+                goto out;
+        }
 
-                if (uuid_compare (stbuf.ia_gfid, local->loc.inode->gfid)) {
+        dst_node = dht_subvol_get_cached (this, tmp_loc.inode);
+        if (linkto_target && dst_node != linkto_target) {
+                gf_msg (this->name, GF_LOG_WARNING, 0,
+                        DHT_MSG_INVALID_LINKFILE,
+                        "linkto target (%s) is "
+                        "different from cached-subvol (%s). Treating %s as "
+                        "destination subvol", linkto_target->name,
+                        dst_node->name, dst_node->name);
+        }
+
+        if (gf_uuid_compare (stbuf.ia_gfid, tmp_loc.inode->gfid)) {
                         gf_msg (this->name, GF_LOG_ERROR, 0,
                                 DHT_MSG_GFID_MISMATCH,
                                 "%s: gfid different on the target file on %s",
-                                local->loc.path, dst_node->name);
-                        ret = -1;
-                        local->op_errno = EIO;
-                        goto out;
-                }
+                                tmp_loc.path ? tmp_loc.path :
+                                uuid_utoa (tmp_loc.gfid), dst_node->name);
+                ret = -1;
+                local->op_errno = EIO;
+                goto out;
         }
 
-        /* update inode ctx (the layout) */
+        /* update local. A layout is set in inode-ctx in lookup already */
+
         dht_layout_unref (this, local->layout);
 
-        ret = dht_layout_preset (this, dst_node, inode);
-        if (ret != 0) {
-                gf_msg_debug (this->name, 0,
-                              "%s: could not set preset layout "
-                              "for subvol %s", local->loc.path,
-                              dst_node->name);
-                ret   = -1;
-                local->op_errno = EINVAL;
-                goto out;
-        }
-
-        layout = dht_layout_for_subvol (this, dst_node);
-        if (!layout) {
-                gf_log (this->name, GF_LOG_INFO,
-                        "%s: no pre-set layout for subvolume %s",
-                        local->loc.path, dst_node ? dst_node->name : "<nil>");
-                ret = -1;
-                local->op_errno = EINVAL;
-                goto out;
-        }
-
-        ret = dht_layout_set (this, inode, layout);
-        if (ret) {
-                gf_log (this->name, GF_LOG_ERROR,
-                        "%s: failed to set the new layout",
-                        local->loc.path);
-                local->op_errno = EINVAL;
-                goto out;
-        }
-
+        local->layout   = dht_layout_get (frame->this, inode);
         local->cached_subvol = dst_node;
+
         ret = 0;
 
         /* once we detect the migration complete, the inode-ctx2 is no more
            required.. delete the ctx and also, it means, open() already
            done on all the fd of inode */
-        ret = inode_ctx_reset1 (inode, this, &tmp_subvol);
-        if (tmp_subvol)
+        ret = inode_ctx_reset1 (inode, this, &tmp_miginfo);
+        if (tmp_miginfo) {
+                miginfo = (void *)tmp_miginfo;
+                GF_REF_PUT (miginfo);
                 goto out;
+        }
+
+        /* perform 'open()' on all the fd's present on the inode */
+        if (tmp_loc.path == NULL) {
+                inode_path (inode, NULL, &path);
+                if (path)
+                        tmp_loc.path = path;
+        }
+
+        LOCK(&inode->lock);
 
         if (list_empty (&inode->fd_list))
-                goto out;
+                goto unlock;
 
         /* perform open as root:root. There is window between linkfile
          * creation(root:root) and setattr with the correct uid/gid
          */
         SYNCTASK_SETID(0, 0);
 
-        /* perform 'open()' on all the fd's present on the inode */
-        tmp_loc.inode = inode;
-        inode_path (inode, NULL, &path);
-        if (path)
-                tmp_loc.path = path;
-        list_for_each_entry (iter_fd, &inode->fd_list, inode_list) {
+        /* It's possible that we are the last user of iter_fd after each
+         * iteration. In this case the fd_unref() of iter_fd at the end of
+         * the loop will cause the destruction of the fd. So we need to
+         * iterate the list safely because iter_fd cannot be trusted.
+         */
+        list_for_each_entry_safe (iter_fd, tmp, &inode->fd_list, inode_list) {
+
                 if (fd_is_anonymous (iter_fd))
                         continue;
+
+                if (dht_fd_open_on_dst (this, iter_fd, dst_node))
+                        continue;
+
+                /* We need to release the inode->lock before calling
+                 * syncop_open() to avoid possible deadlocks. However this
+                 * can cause the iter_fd to be released by other threads.
+                 * To avoid this, we take a reference before releasing the
+                 * lock.
+                 */
+                __fd_ref(iter_fd);
+
+                UNLOCK(&inode->lock);
 
                 /* flags for open are stripped down to allow following the
                  * new location of the file, otherwise we can get EEXIST or
                  * truncate the file again as rebalance is moving the data */
                 ret = syncop_open (dst_node, &tmp_loc,
                                    (iter_fd->flags &
-                                   ~(O_CREAT | O_EXCL | O_TRUNC)), iter_fd);
+                                   ~(O_CREAT | O_EXCL | O_TRUNC)),
+                                   iter_fd, NULL, NULL);
                 if (ret < 0) {
-                        gf_log (this->name, GF_LOG_ERROR, "failed to open "
-                                "the fd (%p, flags=0%o) on file %s @ %s",
-                                iter_fd, iter_fd->flags, path, dst_node->name);
+                        gf_msg (this->name, GF_LOG_ERROR, -ret,
+                                DHT_MSG_OPEN_FD_ON_DST_FAILED, "failed"
+                                " to open the fd"
+                                " (%p, flags=0%o) on file %s @ %s",
+                                iter_fd, iter_fd->flags, path,
+                                dst_node->name);
+
                         open_failed = 1;
                         local->op_errno = -ret;
                         ret = -1;
+                } else {
+                        dht_fd_ctx_set (this, iter_fd, dst_node);
                 }
+
+                fd_unref(iter_fd);
+
+                LOCK(&inode->lock);
         }
-        GF_FREE (path);
 
         SYNCTASK_SETID (frame->root->uid, frame->root->gid);
 
         if (open_failed) {
                 ret = -1;
-                goto out;
+                goto unlock;
         }
         ret = 0;
+
+unlock:
+        UNLOCK(&inode->lock);
+
 out:
+
+        loc_wipe (&tmp_loc);
 
         return ret;
 }
@@ -1086,17 +1323,42 @@ dht_rebalance_complete_check (xlator_t *this, call_frame_t *frame)
                             dht_migration_complete_check_done,
                             frame, frame);
         return ret;
+
 }
 
 /* During 'in-progress' state, both nodes should have the file */
+/*
+ op_ret values :
+  0 : Success
+ -1 : Failure.
+  1 : File is being migrated but not by this DHT layer.
+*/
 static int
-dht_inprogress_check_done (int op_ret, call_frame_t *sync_frame, void *data)
+dht_inprogress_check_done (int op_ret, call_frame_t *frame, void *data)
 {
-        dht_local_t *local = NULL;
+        dht_local_t *local      = NULL;
+        xlator_t    *dst_subvol = NULL, *src_subvol = NULL;
+        inode_t     *inode      = NULL;
 
-        local = sync_frame->local;
+        local = frame->local;
 
-        local->rebalance.target_op_fn (THIS, sync_frame, op_ret);
+        if (op_ret != 0)
+                goto out;
+
+        inode = local->loc.inode ? local->loc.inode : local->fd->inode;
+
+        dht_inode_ctx_get_mig_info (THIS, inode, &src_subvol, &dst_subvol);
+        if (dht_mig_info_is_invalid (local->cached_subvol,
+                                     src_subvol, dst_subvol)) {
+                dst_subvol = dht_subvol_get_cached (THIS, inode);
+                if (!dst_subvol) {
+                        local->op_errno = EINVAL;
+                        goto out;
+                }
+        }
+
+out:
+        local->rebalance.target_op_fn (THIS, dst_subvol, frame, op_ret);
 
         return 0;
 }
@@ -1104,20 +1366,24 @@ dht_inprogress_check_done (int op_ret, call_frame_t *sync_frame, void *data)
 static int
 dht_rebalance_inprogress_task (void *data)
 {
-        int           ret      = -1;
-        xlator_t     *src_node = NULL;
-        xlator_t     *dst_node = NULL;
-        dht_local_t  *local    = NULL;
-        dict_t       *dict     = NULL;
-        call_frame_t *frame    = NULL;
-        xlator_t     *this     = NULL;
-        char         *path     = NULL;
-        struct iatt   stbuf    = {0,};
-        loc_t         tmp_loc  = {0,};
-        dht_conf_t   *conf     = NULL;
-        inode_t      *inode    = NULL;
-        fd_t         *iter_fd  = NULL;
-        int           open_failed = 0;
+        int           ret             = -1;
+        xlator_t     *src_node        = NULL;
+        xlator_t     *dst_node        = NULL;
+        dht_local_t  *local           = NULL;
+        dict_t       *dict            = NULL;
+        call_frame_t *frame           = NULL;
+        xlator_t     *this            = NULL;
+        char         *path            = NULL;
+        struct iatt   stbuf           = {0,};
+        loc_t         tmp_loc         = {0,};
+        dht_conf_t   *conf            = NULL;
+        inode_t      *inode           = NULL;
+        fd_t         *iter_fd         = NULL;
+        fd_t         *tmp             = NULL;
+        int           open_failed     = 0;
+        uint64_t      tmp_miginfo     = 0;
+        dht_migrate_info_t *miginfo   = NULL;
+
 
         this  = THIS;
         frame = data;
@@ -1136,24 +1402,55 @@ dht_rebalance_inprogress_task (void *data)
         if (local->loc.inode) {
                 SYNCTASK_SETID (0, 0);
                 ret = syncop_getxattr (src_node, &local->loc, &dict,
-                                       conf->link_xattr_name);
+                                       conf->link_xattr_name, NULL, NULL);
                 SYNCTASK_SETID (frame->root->uid, frame->root->gid);
         } else {
                 ret = syncop_fgetxattr (src_node, local->fd, &dict,
-                                        conf->link_xattr_name);
+                                        conf->link_xattr_name, NULL, NULL);
+        }
+
+        /*
+         * Each DHT xlator layer has its own name for the linkto xattr.
+         * If the file mode bits indicate the the file is being migrated but
+         * this layer's linkto xattr is not present, it means that another
+         * DHT layer is migrating the file. In this case, return 1 so
+         * the mode bits can be passed on to the higher layer for appropriate
+         * action.
+         */
+
+        if (-ret == ENODATA) {
+                /* This DHT layer is not migrating this file */
+                ret = inode_ctx_reset1 (inode, this, &tmp_miginfo);
+                if (tmp_miginfo) {
+                        /* This can be a problem if the file was
+                         * migrated by two different layers. Raise
+                         * a warning here.
+                         */
+                        gf_msg (this->name, GF_LOG_WARNING, 0,
+                                DHT_MSG_HAS_MIGINFO,
+                                "%s: Found miginfo in the inode ctx",
+                                tmp_loc.path ? tmp_loc.path :
+                                uuid_utoa (tmp_loc.gfid));
+                        miginfo = (void *)tmp_miginfo;
+                        GF_REF_PUT (miginfo);
+                }
+                ret = 1;
+                goto out;
         }
 
         if (ret < 0) {
-                gf_log (this->name, GF_LOG_ERROR,
-                        "%s: failed to get the 'linkto' xattr %s",
-                        local->loc.path, strerror (-ret));
+                gf_msg (this->name, GF_LOG_ERROR, -ret,
+                        DHT_MSG_GET_XATTR_FAILED,
+                        "%s: failed to get the 'linkto' xattr",
+                        local->loc.path);
                 ret = -1;
                 goto out;
         }
 
         dst_node = dht_linkfile_subvol (this, NULL, NULL, dict);
         if (!dst_node) {
-                gf_log (this->name, GF_LOG_ERROR,
+                gf_msg (this->name, GF_LOG_ERROR, 0,
+                        DHT_MSG_SUBVOL_NOT_FOUND,
                         "%s: failed to get the 'linkto' xattr from dict",
                         local->loc.path);
                 ret = -1;
@@ -1163,73 +1460,115 @@ dht_rebalance_inprogress_task (void *data)
         local->rebalance.target_node = dst_node;
 
         if (local->loc.inode) {
-                /* lookup on dst */
-                ret = syncop_lookup (dst_node, &local->loc, NULL,
-                                     &stbuf, NULL, NULL);
-                if (ret) {
-                        gf_log (this->name, GF_LOG_ERROR,
-                                "%s: failed to lookup the file on %s",
-                                local->loc.path, dst_node->name);
-                        ret = -1;
-                        goto out;
-                }
-
-                if (uuid_compare (stbuf.ia_gfid, local->loc.inode->gfid)) {
-                        gf_msg (this->name, GF_LOG_ERROR, 0,
-                                DHT_MSG_GFID_MISMATCH,
-                                "%s: gfid different on the target file on %s",
-                                local->loc.path, dst_node->name);
-                        ret = -1;
-                        goto out;
-                }
+                loc_copy (&tmp_loc, &local->loc);
+        } else {
+                tmp_loc.inode = inode_ref (inode);
+                gf_uuid_copy (tmp_loc.gfid, inode->gfid);
         }
 
+        /* lookup on dst */
+        ret = syncop_lookup (dst_node, &tmp_loc, &stbuf, NULL,
+                             NULL, NULL);
+        if (ret) {
+                gf_msg (this->name, GF_LOG_ERROR, -ret,
+                        DHT_MSG_FILE_LOOKUP_ON_DST_FAILED,
+                        "%s: failed to lookup the file on %s",
+                        tmp_loc.path ? tmp_loc.path : uuid_utoa (tmp_loc.gfid),
+                        dst_node->name);
+                ret = -1;
+                goto out;
+        }
+
+        if (gf_uuid_compare (stbuf.ia_gfid, tmp_loc.inode->gfid)) {
+                gf_msg (this->name, GF_LOG_ERROR, 0,
+                        DHT_MSG_GFID_MISMATCH,
+                        "%s: gfid different on the target file on %s",
+                        tmp_loc.path ? tmp_loc.path : uuid_utoa (tmp_loc.gfid),
+                        dst_node->name);
+                ret = -1;
+                goto out;
+        }
         ret = 0;
 
+        if (tmp_loc.path == NULL) {
+                inode_path (inode, NULL, &path);
+                if (path)
+                        tmp_loc.path = path;
+        }
+
+        LOCK(&inode->lock);
+
         if (list_empty (&inode->fd_list))
-                goto done;
+                goto unlock;
 
         /* perform open as root:root. There is window between linkfile
          * creation(root:root) and setattr with the correct uid/gid
          */
         SYNCTASK_SETID (0, 0);
 
-        tmp_loc.inode = inode;
-        inode_path (inode, NULL, &path);
-        if (path)
-                tmp_loc.path = path;
-
-        list_for_each_entry (iter_fd, &inode->fd_list, inode_list) {
+        /* It's possible that we are the last user of iter_fd after each
+         * iteration. In this case the fd_unref() of iter_fd at the end of
+         * the loop will cause the destruction of the fd. So we need to
+         * iterate the list safely because iter_fd cannot be trusted.
+         */
+        list_for_each_entry_safe (iter_fd, tmp, &inode->fd_list, inode_list) {
                 if (fd_is_anonymous (iter_fd))
                         continue;
+
+                if (dht_fd_open_on_dst (this, iter_fd, dst_node))
+                        continue;
+
+                /* We need to release the inode->lock before calling
+                 * syncop_open() to avoid possible deadlocks. However this
+                 * can cause the iter_fd to be released by other threads.
+                 * To avoid this, we take a reference before releasing the
+                 * lock.
+                 */
+                __fd_ref(iter_fd);
+
+                UNLOCK(&inode->lock);
 
                 /* flags for open are stripped down to allow following the
                  * new location of the file, otherwise we can get EEXIST or
                  * truncate the file again as rebalance is moving the data */
                 ret = syncop_open (dst_node, &tmp_loc,
-                                   (iter_fd->flags &
-                                   ~(O_CREAT | O_EXCL | O_TRUNC)), iter_fd);
+                                  (iter_fd->flags &
+                                   ~(O_CREAT | O_EXCL | O_TRUNC)),
+                                   iter_fd, NULL, NULL);
                 if (ret < 0) {
-                        gf_log (this->name, GF_LOG_ERROR, "failed to send open "
+                        gf_msg (this->name, GF_LOG_ERROR, -ret,
+                                DHT_MSG_OPEN_FD_ON_DST_FAILED,
+                                "failed to send open "
                                 "the fd (%p, flags=0%o) on file %s @ %s",
-                                iter_fd, iter_fd->flags, path, dst_node->name);
+                                iter_fd, iter_fd->flags, path,
+                                dst_node->name);
                         ret = -1;
                         open_failed = 1;
+                } else {
+                        /* Potential fd leak if this fails here as it will be
+                           reopened at the next Phase1/2 check */
+                        dht_fd_ctx_set (this, iter_fd, dst_node);
                 }
+
+                fd_unref(iter_fd);
+
+                LOCK(&inode->lock);
         }
-        GF_FREE (path);
 
         SYNCTASK_SETID (frame->root->uid, frame->root->gid);
+
+unlock:
+        UNLOCK(&inode->lock);
 
         if (open_failed) {
                 ret = -1;
                 goto out;
         }
 
-done:
-        ret = dht_inode_ctx_set1 (this, inode, dst_node);
+        ret = dht_inode_ctx_set_mig_info (this, inode, src_node, dst_node);
         if (ret) {
-                gf_log (this->name, GF_LOG_ERROR,
+                gf_msg (this->name, GF_LOG_ERROR, 0,
+                        DHT_MSG_SET_INODE_CTX_FAILED,
                         "%s: failed to set inode-ctx target file at %s",
                         local->loc.path, dst_node->name);
                 goto out;
@@ -1237,6 +1576,7 @@ done:
 
         ret = 0;
 out:
+        loc_wipe (&tmp_loc);
         return ret;
 }
 
@@ -1370,6 +1710,22 @@ out:
         return ret;
 }
 
+void
+dht_set_lkowner (dht_lock_t **lk_array, int count, gf_lkowner_t *lkowner)
+{
+        int i = 0;
+
+        if (!lk_array || !lkowner)
+                goto out;
+
+        for (i = 0; i < count; i++) {
+                lk_array[i]->lk_owner = *lkowner;
+        }
+
+out:
+        return;
+}
+
 int
 dht_subvol_status (dht_conf_t *conf, xlator_t *subvol)
 {
@@ -1415,7 +1771,7 @@ dht_inodelk_cleanup_cbk (call_frame_t *frame, void *cookie,
         return 0;
 }
 
-static inline int32_t
+int32_t
 dht_lock_count (dht_lock_t **lk_array, int lk_count)
 {
         int i = 0, locked = 0;
@@ -1469,10 +1825,11 @@ dht_unlock_inodelk_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
                 uuid_utoa_r (local->lock.locks[lk_index]->loc.gfid,
                              gfid);
 
-                gf_log (this->name, GF_LOG_WARNING,
-                        "unlocking failed on %s:%s (%s)",
+                gf_msg (this->name, GF_LOG_WARNING, op_errno,
+                        DHT_MSG_UNLOCKING_FAILED,
+                        "unlocking failed on %s:%s",
                         local->lock.locks[lk_index]->xl->name,
-                        gfid, strerror (op_errno));
+                        gfid);
         } else {
                 local->lock.locks[lk_index]->locked = 0;
         }
@@ -1522,7 +1879,8 @@ dht_unlock_inodelk (call_frame_t *frame, dht_lock_t **lk_array, int lk_count,
 
         lock_frame = dht_lock_frame (frame);
         if (lock_frame == NULL) {
-                gf_log (frame->this->name, GF_LOG_WARNING,
+                gf_msg (frame->this->name, GF_LOG_WARNING, 0,
+                        DHT_MSG_UNLOCKING_FAILED,
                         "cannot allocate a frame, not unlocking following "
                         "locks:");
 
@@ -1533,7 +1891,8 @@ dht_unlock_inodelk (call_frame_t *frame, dht_lock_t **lk_array, int lk_count,
 
         ret = dht_local_lock_init (lock_frame, lk_array, lk_count, inodelk_cbk);
         if (ret < 0) {
-                gf_log (frame->this->name, GF_LOG_WARNING,
+                gf_msg (frame->this->name, GF_LOG_WARNING, 0,
+                        DHT_MSG_UNLOCKING_FAILED,
                         "storing locks in local failed, not unlocking "
                         "following locks:");
 
@@ -1553,6 +1912,7 @@ dht_unlock_inodelk (call_frame_t *frame, dht_lock_t **lk_array, int lk_count,
                 if (!local->lock.locks[i]->locked)
                         continue;
 
+                lock_frame->root->lk_owner = local->lock.locks[i]->lk_owner;
                 STACK_WIND_COOKIE (lock_frame, dht_unlock_inodelk_cbk,
                                    (void *)(long)i,
                                    local->lock.locks[i]->xl,
@@ -1560,6 +1920,8 @@ dht_unlock_inodelk (call_frame_t *frame, dht_lock_t **lk_array, int lk_count,
                                    local->lock.locks[i]->domain,
                                    &local->lock.locks[i]->loc, F_SETLK,
                                    &flock, NULL);
+                if (!--call_cnt)
+                        break;
         }
 
         return 0;
@@ -1594,11 +1956,10 @@ dht_nonblocking_inodelk_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
                         uuid_utoa_r (local->lock.locks[lk_index]->loc.inode->gfid,
                                      gfid);
 
-                        gf_log (this->name, GF_LOG_DEBUG,
-                                "inodelk failed on gfid: %s "
-                                "subvolume: %s (%s)", gfid,
-                                local->lock.locks[lk_index]->xl->name,
-                                strerror (op_errno));
+                        gf_msg_debug (this->name, op_errno,
+                                      "inodelk failed on gfid: %s "
+                                      "subvolume: %s", gfid,
+                                      local->lock.locks[lk_index]->xl->name);
                 }
 
                 goto out;
@@ -1642,12 +2003,14 @@ dht_nonblocking_inodelk (call_frame_t *frame, dht_lock_t **lk_array,
                 goto out;
         }
 
+        dht_set_lkowner (lk_array, lk_count, &lock_frame->root->lk_owner);
+
         local = lock_frame->local;
         local->main_frame = frame;
 
         local->call_cnt = lk_count;
 
-        for (i = 0; i < local->lock.lk_count; i++) {
+        for (i = 0; i < lk_count; i++) {
                 flock.l_type = local->lock.locks[i]->type;
 
                 STACK_WIND_COOKIE (lock_frame, dht_nonblocking_inodelk_cbk,
@@ -1673,21 +2036,41 @@ dht_blocking_inodelk_cbk (call_frame_t *frame, void *cookie, xlator_t *this,
                           int32_t op_ret, int32_t op_errno, dict_t *xdata)
 {
         int          lk_index = 0;
+        int          i        = 0;
         dht_local_t *local    = NULL;
 
         lk_index = (long) cookie;
 
         local = frame->local;
-
         if (op_ret == 0) {
                 local->lock.locks[lk_index]->locked = _gf_true;
         } else {
-                local->lock.op_ret = -1;
-                local->lock.op_errno = op_errno;
-                goto cleanup;
+                switch (op_errno) {
+                case ESTALE:
+                case ENOENT:
+                        if (local->lock.reaction != IGNORE_ENOENT_ESTALE) {
+                                local->lock.op_ret = -1;
+                                local->lock.op_errno = op_errno;
+                                goto cleanup;
+                        }
+                        break;
+                default:
+                        local->lock.op_ret = -1;
+                        local->lock.op_errno = op_errno;
+                        goto cleanup;
+                }
         }
 
         if (lk_index == (local->lock.lk_count - 1)) {
+                for (i = 0; (i < local->lock.lk_count) &&
+                     (!local->lock.locks[i]->locked); i++)
+                        ;
+
+                if (i == local->lock.lk_count) {
+                        local->lock.op_ret = -1;
+                        local->lock.op_errno = op_errno;
+                }
+
                 dht_inodelk_done (frame);
         } else {
                 dht_blocking_inodelk_rec (frame, ++lk_index);
@@ -1737,7 +2120,7 @@ dht_lock_request_cmp (const void *val1, const void *val2)
         ret = strcmp (lock1->xl->name, lock2->xl->name);
 
         if (ret == 0) {
-                ret = uuid_compare (lock1->loc.gfid, lock2->loc.gfid);
+                ret = gf_uuid_compare (lock1->loc.gfid, lock2->loc.gfid);
         }
 
 out:
@@ -1761,7 +2144,8 @@ out:
 
 int
 dht_blocking_inodelk (call_frame_t *frame, dht_lock_t **lk_array,
-                      int lk_count, fop_inodelk_cbk_t inodelk_cbk)
+                      int lk_count, dht_reaction_type_t reaction,
+                      fop_inodelk_cbk_t inodelk_cbk)
 {
         int           ret        = -1;
         call_frame_t *lock_frame = NULL;
@@ -1780,7 +2164,10 @@ dht_blocking_inodelk (call_frame_t *frame, dht_lock_t **lk_array,
                 goto out;
         }
 
+        dht_set_lkowner (lk_array, lk_count, &lock_frame->root->lk_owner);
+
         local = lock_frame->local;
+        local->lock.reaction = reaction;
         local->main_frame = frame;
 
         dht_blocking_inodelk_rec (lock_frame, 0);
@@ -1791,4 +2178,332 @@ out:
                 dht_lock_stack_destroy (lock_frame);
 
         return -1;
+}
+inode_t*
+dht_heal_path (xlator_t *this, char *path, inode_table_t *itable)
+{
+        int             ret             = -1;
+        struct iatt     iatt            = {0, };
+        inode_t        *linked_inode    = NULL;
+        loc_t           loc             = {0, };
+        char           *bname           = NULL;
+        char           *save_ptr        = NULL;
+        uuid_t          gfid            = {0, };
+        char           *tmp_path        = NULL;
+
+
+        tmp_path = gf_strdup (path);
+        if (!tmp_path) {
+                goto out;
+        }
+
+        memset (gfid, 0, 16);
+        gfid[15] = 1;
+
+        gf_uuid_copy (loc.pargfid, gfid);
+        loc.parent = inode_ref (itable->root);
+
+        bname = strtok_r (tmp_path, "/",  &save_ptr);
+
+        /* sending a lookup on parent directory,
+         * Eg:  if  path is like /a/b/c/d/e/f/g/
+         * then we will send a lookup on a first and then b,c,d,etc
+         */
+
+        while (bname) {
+                linked_inode = NULL;
+                loc.inode = inode_grep (itable, loc.parent, bname);
+                if (loc.inode == NULL) {
+                        loc.inode = inode_new (itable);
+                        if (loc.inode == NULL) {
+                                ret = -ENOMEM;
+                                goto out;
+                        }
+                } else {
+                        /*
+                         * Inode is already populated in the inode table.
+                         * Which means we already looked up the inde and
+                         * linked with a dentry. So that we will skip
+                         * lookup on this entry, and proceed to next.
+                         */
+                        bname = strtok_r (NULL, "/",  &save_ptr);
+                        inode_unref (loc.parent);
+                        loc.parent = loc.inode;
+                        gf_uuid_copy (loc.pargfid, loc.inode->gfid);
+                        loc.inode = NULL;
+                        continue;
+                }
+
+                loc.name = bname;
+                ret = loc_path (&loc, bname);
+
+                ret = syncop_lookup (this, &loc, &iatt, NULL, NULL, NULL);
+                if (ret) {
+                        gf_msg (this->name, GF_LOG_INFO, -ret,
+                                DHT_MSG_DIR_SELFHEAL_FAILED,
+                                "Healing of path %s failed on subvolume %s for "
+                                "directory %s", path, this->name, bname);
+                        goto out;
+                }
+
+                linked_inode = inode_link (loc.inode, loc.parent, bname, &iatt);
+                if (!linked_inode)
+                        goto out;
+
+                loc_wipe (&loc);
+                gf_uuid_copy (loc.pargfid, linked_inode->gfid);
+                loc.inode = NULL;
+                loc.parent = linked_inode;
+
+                bname = strtok_r (NULL, "/",  &save_ptr);
+        }
+out:
+        inode_ref (linked_inode);
+        loc_wipe (&loc);
+        GF_FREE (tmp_path);
+
+        return linked_inode;
+}
+
+
+int
+dht_heal_full_path (void *data)
+{
+        call_frame_t            *heal_frame     = data;
+        dht_local_t             *local          = NULL;
+        loc_t                    loc            = {0, };
+        dict_t                  *dict           = NULL;
+        char                    *path           = NULL;
+        int                      ret            = -1;
+        xlator_t                *source         = NULL;
+        xlator_t                *this           = NULL;
+        inode_table_t           *itable         = NULL;
+        inode_t                 *inode          = NULL;
+        inode_t                 *tmp_inode      = NULL;
+
+        GF_VALIDATE_OR_GOTO ("DHT", heal_frame, out);
+
+        local = heal_frame->local;
+        this = heal_frame->this;
+        source = heal_frame->cookie;
+        heal_frame->cookie = NULL;
+        gf_uuid_copy (loc.gfid, local->gfid);
+
+        if (local->loc.inode)
+                loc.inode = inode_ref (local->loc.inode);
+        else
+                goto out;
+
+        itable = loc.inode->table;
+        ret = syncop_getxattr (source, &loc, &dict,
+                       GET_ANCESTRY_PATH_KEY, NULL, NULL);
+        if (ret) {
+                gf_msg (this->name, GF_LOG_INFO, -ret,
+                        DHT_MSG_DIR_SELFHEAL_FAILED,
+                        "Failed to get path from subvol %s. Aborting "
+                        "directory healing.", source->name);
+                goto out;
+        }
+
+        ret = dict_get_str (dict, GET_ANCESTRY_PATH_KEY, &path);
+        if (path) {
+                inode = dht_heal_path (this, path, itable);
+                if (inode && inode != local->inode) {
+                        /*
+                         * if inode returned by heal function is different
+                         * from what we passed, which means a racing thread
+                         * already linked a different inode for dentry.
+                         * So we will update our local->inode, so that we can
+                         * retrurn proper inode.
+                         */
+                        tmp_inode = local->inode;
+                        local->inode = inode;
+                        inode_unref (tmp_inode);
+                        tmp_inode = NULL;
+                } else {
+                        inode_unref (inode);
+                }
+        }
+
+out:
+        loc_wipe (&loc);
+        if (dict)
+                dict_unref (dict);
+        return 0;
+}
+
+int
+dht_heal_full_path_done (int op_ret, call_frame_t *heal_frame, void *data)
+{
+
+        call_frame_t            *main_frame       = NULL;
+        dht_local_t             *local            = NULL;
+
+        local = heal_frame->local;
+        main_frame = local->main_frame;
+        local->main_frame = NULL;
+
+        dht_set_fixed_dir_stat (&local->postparent);
+
+        DHT_STACK_UNWIND (lookup, main_frame, 0, 0,
+                          local->inode, &local->stbuf, local->xattr,
+                          &local->postparent);
+
+        DHT_STACK_DESTROY (heal_frame);
+        return 0;
+}
+
+/* This function must be called inside an inode lock */
+int
+__dht_lock_subvol_set (inode_t *inode, xlator_t *this,
+                       xlator_t *lock_subvol)
+{
+        dht_inode_ctx_t         *ctx            = NULL;
+        int                      ret            = -1;
+        uint64_t                 value          = 0;
+
+        GF_VALIDATE_OR_GOTO (this->name, inode, out);
+
+        ret = __inode_ctx_get0 (inode, this, &value);
+        if (ret || !value) {
+                return -1;
+        }
+
+        ctx = (dht_inode_ctx_t *) value;
+        ctx->lock_subvol = lock_subvol;
+out:
+        return ret;
+}
+
+xlator_t*
+dht_get_lock_subvolume (xlator_t *this, struct gf_flock *lock,
+                        dht_local_t *local)
+{
+        xlator_t                *subvol                  = NULL;
+        inode_t                 *inode                   = NULL;
+        int32_t                  ret                     = -1;
+        uint64_t                 value                   = 0;
+        xlator_t                *cached_subvol           = NULL;
+        dht_inode_ctx_t         *ctx                     = NULL;
+        char                     gfid[GF_UUID_BUF_SIZE]  = {0};
+
+        GF_VALIDATE_OR_GOTO (this->name, lock, out);
+        GF_VALIDATE_OR_GOTO (this->name, local, out);
+
+        cached_subvol = local->cached_subvol;
+
+        if (local->loc.inode || local->fd) {
+                inode = local->loc.inode ? local->loc.inode : local->fd->inode;
+        }
+
+        if (!inode)
+                goto out;
+
+        if (!(IA_ISDIR (inode->ia_type) || IA_ISINVAL (inode->ia_type))) {
+                /*
+                 * We may get non-linked inode for directories as part
+                 * of the selfheal code path. So checking  for IA_INVAL
+                 * type also. This will only happen for directory.
+                 */
+                subvol = local->cached_subvol;
+                goto out;
+        }
+
+        if (lock->l_type != F_UNLCK) {
+                /*
+                 * inode purging might happen on NFS between a lk
+                 * and unlk. Due to this lk and unlk might be sent
+                 * to different subvols.
+                 * So during a lock request, taking a ref on inode
+                 * to prevent inode purging. inode unref will happen
+                 * in unlock cbk code path.
+                 */
+                inode_ref (inode);
+        }
+
+        LOCK (&inode->lock);
+                ret = __inode_ctx_get0 (inode, this, &value);
+                if (!ret && value) {
+                        ctx = (dht_inode_ctx_t *) value;
+                        subvol = ctx->lock_subvol;
+                }
+                if (!subvol && lock->l_type != F_UNLCK && cached_subvol) {
+                        ret = __dht_lock_subvol_set (inode, this,
+                                                     cached_subvol);
+                        if (ret) {
+                                gf_uuid_unparse(inode->gfid, gfid);
+                                gf_msg (this->name, GF_LOG_WARNING, 0,
+                                        DHT_MSG_SET_INODE_CTX_FAILED,
+                                        "Failed to set lock_subvol in "
+                                        "inode ctx for gfid %s",
+                                        gfid);
+                                goto unlock;
+                        }
+                        subvol = cached_subvol;
+                }
+unlock:
+        UNLOCK (&inode->lock);
+        if (!subvol && inode && lock->l_type != F_UNLCK) {
+                inode_unref (inode);
+        }
+out:
+        return subvol;
+}
+
+int
+dht_lk_inode_unref (call_frame_t *frame, int32_t op_ret)
+{
+        int                     ret                     = -1;
+        dht_local_t            *local                   = NULL;
+        inode_t                *inode                   = NULL;
+        xlator_t               *this                    = NULL;
+        char                    gfid[GF_UUID_BUF_SIZE]  = {0};
+
+        local = frame->local;
+        this = frame->this;
+
+        if (local->loc.inode || local->fd) {
+                inode = local->loc.inode ? local->loc.inode : local->fd->inode;
+        }
+        if (!inode) {
+                gf_msg (this->name, GF_LOG_WARNING, 0,
+                        DHT_MSG_LOCK_INODE_UNREF_FAILED,
+                        "Found a NULL inode. Failed to unref the inode");
+                goto out;
+        }
+
+        if (!(IA_ISDIR (inode->ia_type) || IA_ISINVAL (inode->ia_type))) {
+                ret = 0;
+                goto out;
+        }
+
+        switch (local->lock_type) {
+        case F_RDLCK:
+        case F_WRLCK:
+                if (op_ret) {
+                        gf_uuid_unparse(inode->gfid, gfid);
+                        gf_msg_debug (this->name, 0,
+                                "lock request failed for gfid %s", gfid);
+                        inode_unref (inode);
+                        goto out;
+                }
+                break;
+
+        case F_UNLCK:
+                if (!op_ret) {
+                        inode_unref (inode);
+                } else {
+                        gf_uuid_unparse(inode->gfid, gfid);
+                        gf_msg (this->name, GF_LOG_WARNING, 0,
+                                DHT_MSG_LOCK_INODE_UNREF_FAILED,
+                                "Unlock request failed for gfid %s."
+                                "Failed to unref the inode", gfid);
+                        goto out;
+                }
+        default:
+                break;
+        }
+        ret = 0;
+out:
+        return ret;
 }

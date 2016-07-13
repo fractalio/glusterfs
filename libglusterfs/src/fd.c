@@ -13,12 +13,7 @@
 #include "inode.h"
 #include "dict.h"
 #include "statedump.h"
-
-
-#ifndef _CONFIG_H
-#define _CONFIG_H
-#include "config.h"
-#endif
+#include "libglusterfs-messages.h"
 
 
 static int
@@ -35,7 +30,8 @@ gf_fd_chain_fd_entries (fdentry_t *entries, uint32_t startidx,
         uint32_t        i = 0;
 
         if (!entries) {
-                gf_log_callingfn ("fd", GF_LOG_WARNING, "!entries");
+                gf_msg_callingfn ("fd", GF_LOG_WARNING, EINVAL,
+                                  LG_MSG_INVALID_ARG, "!entries");
                 return -1;
         }
 
@@ -60,7 +56,8 @@ gf_fd_fdtable_expand (fdtable_t *fdtable, uint32_t nr)
         int          ret = -1;
 
         if (fdtable == NULL || nr > UINT32_MAX) {
-                gf_log_callingfn ("fd", GF_LOG_ERROR, "invalid argument");
+                gf_msg_callingfn ("fd", GF_LOG_ERROR, EINVAL,
+                                  LG_MSG_INVALID_ARG, "invalid argument");
                 ret = EINVAL;
                 goto out;
         }
@@ -127,7 +124,8 @@ __gf_fd_fdtable_get_all_fds (fdtable_t *fdtable, uint32_t *count)
         fdentry_t       *fdentries = NULL;
 
         if (count == NULL) {
-                gf_log_callingfn ("fd", GF_LOG_WARNING, "!count");
+                gf_msg_callingfn ("fd", GF_LOG_WARNING, EINVAL,
+                                  LG_MSG_INVALID_ARG, "!count");
                 goto out;
         }
 
@@ -166,7 +164,8 @@ __gf_fd_fdtable_copy_all_fds (fdtable_t *fdtable, uint32_t *count)
         int        i         = 0;
 
         if (count == NULL) {
-                gf_log_callingfn ("fd", GF_LOG_WARNING, "!count");
+                gf_msg_callingfn ("fd", GF_LOG_WARNING, EINVAL,
+                                  LG_MSG_INVALID_ARG, "!count");
                 goto out;
         }
 
@@ -218,7 +217,8 @@ gf_fd_fdtable_destroy (fdtable_t *fdtable)
         INIT_LIST_HEAD (&list);
 
         if (!fdtable) {
-                gf_log_callingfn ("fd", GF_LOG_WARNING, "!fdtable");
+                gf_msg_callingfn ("fd", GF_LOG_WARNING, EINVAL,
+                                  LG_MSG_INVALID_ARG, "!fdtable");
                 return;
         }
 
@@ -253,7 +253,8 @@ gf_fd_unused_get (fdtable_t *fdtable, fd_t *fdptr)
         int             alloc_attempts = 0;
 
         if (fdtable == NULL || fdptr == NULL) {
-                gf_log_callingfn ("fd", GF_LOG_ERROR, "invalid argument");
+                gf_msg_callingfn ("fd", GF_LOG_ERROR, EINVAL,
+                                  LG_MSG_INVALID_ARG, "invalid argument");
                 return EINVAL;
         }
 
@@ -271,7 +272,8 @@ gf_fd_unused_get (fdtable_t *fdtable, fd_t *fdptr)
                          * seriously wrong with our data structures.
                          */
                         if (alloc_attempts >= 2) {
-                                gf_log ("fd", GF_LOG_ERROR,
+                                gf_msg ("fd", GF_LOG_ERROR, 0,
+                                        LG_MSG_EXPAND_FD_TABLE_FAILED,
                                         "multiple attempts to expand fd table"
                                         " have failed.");
                                 goto out;
@@ -279,9 +281,9 @@ gf_fd_unused_get (fdtable_t *fdtable, fd_t *fdptr)
                         error = gf_fd_fdtable_expand (fdtable,
                                                       fdtable->max_fds + 1);
                         if (error) {
-                                gf_log ("fd", GF_LOG_ERROR,
-                                        "Cannot expand fdtable: %s",
-                                        strerror (error));
+                                gf_msg ("fd", GF_LOG_ERROR, error,
+                                        LG_MSG_EXPAND_FD_TABLE_FAILED,
+                                        "Cannot expand fdtable");
                                 goto out;
                         }
                         ++alloc_attempts;
@@ -301,23 +303,24 @@ out:
 }
 
 
-inline void
+void
 gf_fd_put (fdtable_t *fdtable, int32_t fd)
 {
         fd_t *fdptr = NULL;
         fdentry_t *fde = NULL;
 
-        if (fd == -2)
-                /* anonymous fd */
+        if (fd == GF_ANON_FD_NO)
                 return;
 
         if (fdtable == NULL || fd < 0) {
-                gf_log_callingfn ("fd", GF_LOG_ERROR, "invalid argument");
+                gf_msg_callingfn ("fd", GF_LOG_ERROR, EINVAL,
+                                  LG_MSG_INVALID_ARG, "invalid argument");
                 return;
         }
 
         if (!(fd < fdtable->max_fds)) {
-                gf_log_callingfn ("fd", GF_LOG_ERROR, "invalid argument");
+                gf_msg_callingfn ("fd", GF_LOG_ERROR, EINVAL,
+                                  LG_MSG_INVALID_ARG, "invalid argument");
                 return;
         }
 
@@ -347,14 +350,15 @@ unlock_out:
 }
 
 
-inline void
+void
 gf_fdptr_put (fdtable_t *fdtable, fd_t *fd)
 {
         fdentry_t *fde   = NULL;
         int32_t    i     = 0;
 
         if ((fdtable == NULL) || (fd == NULL)) {
-                gf_log_callingfn ("fd", GF_LOG_ERROR, "invalid argument");
+                gf_msg_callingfn ("fd", GF_LOG_ERROR, EINVAL,
+                                  LG_MSG_INVALID_ARG, "invalid argument");
                 return;
         }
 
@@ -368,8 +372,10 @@ gf_fdptr_put (fdtable_t *fdtable, fd_t *fd)
                 }
 
                 if (fde == NULL) {
-                        gf_log_callingfn ("fd", GF_LOG_WARNING,
-                                "fd (%p) is not present in fdtable", fd);
+                        gf_msg_callingfn ("fd", GF_LOG_WARNING, 0,
+                                          LG_MSG_FD_NOT_FOUND_IN_FDTABLE,
+                                          "fd (%p) is not present in fdtable",
+                                          fd);
                         goto unlock_out;
                 }
 
@@ -401,13 +407,15 @@ gf_fd_fdptr_get (fdtable_t *fdtable, int64_t fd)
         fd_t *fdptr = NULL;
 
         if (fdtable == NULL || fd < 0) {
-                gf_log_callingfn ("fd", GF_LOG_ERROR, "invalid argument");
+                gf_msg_callingfn ("fd", GF_LOG_ERROR, EINVAL,
+                                  LG_MSG_INVALID_ARG, "invalid argument");
                 errno = EINVAL;
                 return NULL;
         }
 
         if (!(fd < fdtable->max_fds)) {
-                gf_log_callingfn ("fd", GF_LOG_ERROR, "invalid argument");
+                gf_msg_callingfn ("fd", GF_LOG_ERROR, EINVAL,
+                                  LG_MSG_INVALID_ARG, "invalid argument");
                 errno = EINVAL;
                 return NULL;
         }
@@ -440,7 +448,8 @@ fd_ref (fd_t *fd)
         fd_t *refed_fd = NULL;
 
         if (!fd) {
-                gf_log_callingfn ("fd", GF_LOG_ERROR, "null fd");
+                gf_msg_callingfn ("fd", GF_LOG_ERROR, EINVAL,
+                                  LG_MSG_INVALID_ARG, "null fd");
                 return NULL;
         }
 
@@ -459,28 +468,27 @@ __fd_unref (fd_t *fd)
 
         --fd->refcount;
 
-        if (fd->refcount == 0) {
-                list_del_init (&fd->inode_list);
-        }
-
         return fd;
 }
 
 
 static void
-fd_destroy (fd_t *fd)
+fd_destroy (fd_t *fd, gf_boolean_t bound)
 {
         xlator_t    *xl = NULL;
         int          i = 0;
         xlator_t    *old_THIS = NULL;
 
         if (fd == NULL){
-                gf_log_callingfn ("xlator", GF_LOG_ERROR, "invalid argument");
+                gf_msg_callingfn ("xlator", GF_LOG_ERROR,  EINVAL,
+                                  LG_MSG_INVALID_ARG, "invalid argument");
                 goto out;
         }
 
         if (fd->inode == NULL){
-                gf_log_callingfn ("xlator", GF_LOG_ERROR, "fd->inode is NULL");
+                gf_msg_callingfn ("xlator", GF_LOG_ERROR, 0,
+                                  LG_MSG_FD_INODE_NULL,
+                                  "fd->inode is NULL");
                 goto out;
         }
         if (!fd->_ctx)
@@ -513,13 +521,16 @@ fd_destroy (fd_t *fd)
         LOCK_DESTROY (&fd->lock);
 
         GF_FREE (fd->_ctx);
-        LOCK (&fd->inode->lock);
-        {
-                fd->inode->fd_count--;
+        if (bound) {
+                /*Decrease the count only after close happens on file*/
+                LOCK (&fd->inode->lock);
+                {
+                        fd->inode->fd_count--;
+                }
+                UNLOCK (&fd->inode->lock);
         }
-        UNLOCK (&fd->inode->lock);
         inode_unref (fd->inode);
-        fd->inode = (inode_t *)0xaaaaaaaa;
+        fd->inode = NULL;
         fd_lk_ctx_unref (fd->lk_ctx);
         mem_put (fd);
 out:
@@ -531,9 +542,11 @@ void
 fd_unref (fd_t *fd)
 {
         int32_t refcount = 0;
+        gf_boolean_t bound = _gf_false;
 
         if (!fd) {
-                gf_log_callingfn ("fd", GF_LOG_ERROR, "fd is NULL");
+                gf_msg_callingfn ("fd", GF_LOG_ERROR, EINVAL,
+                                  LG_MSG_INVALID_ARG, "fd is NULL");
                 return;
         }
 
@@ -541,11 +554,18 @@ fd_unref (fd_t *fd)
         {
                 __fd_unref (fd);
                 refcount = fd->refcount;
+                if (refcount == 0) {
+                        if (!list_empty (&fd->inode_list)) {
+                                list_del_init (&fd->inode_list);
+                                bound = _gf_true;
+                        }
+                }
+
         }
         UNLOCK (&fd->inode->lock);
 
         if (refcount == 0) {
-                fd_destroy (fd);
+                fd_destroy (fd, bound);
         }
 
         return ;
@@ -567,7 +587,8 @@ fd_t *
 fd_bind (fd_t *fd)
 {
         if (!fd || !fd->inode) {
-                gf_log_callingfn ("fd", GF_LOG_ERROR, "!fd || !fd->inode");
+                gf_msg_callingfn ("fd", GF_LOG_ERROR, EINVAL,
+                                  LG_MSG_INVALID_ARG, "!fd || !fd->inode");
                 return NULL;
         }
 
@@ -587,7 +608,8 @@ __fd_create (inode_t *inode, uint64_t pid)
         fd_t *fd = NULL;
 
         if (inode == NULL) {
-                gf_log_callingfn ("fd", GF_LOG_ERROR, "invalid argument");
+                gf_msg_callingfn ("fd", GF_LOG_ERROR, EINVAL,
+                                  LG_MSG_INVALID_ARG, "invalid argument");
                 return NULL;
         }
 
@@ -687,7 +709,8 @@ fd_lookup (inode_t *inode, pid_t pid)
         fd_t *fd = NULL;
 
         if (!inode) {
-                gf_log_callingfn ("fd", GF_LOG_WARNING, "!inode");
+                gf_msg_callingfn ("fd", GF_LOG_WARNING, EINVAL,
+                                  LG_MSG_INVALID_ARG, "!inode");
                 return NULL;
         }
 
@@ -706,7 +729,8 @@ fd_lookup_uint64 (inode_t *inode, uint64_t pid)
         fd_t *fd = NULL;
 
         if (!inode) {
-                gf_log_callingfn ("fd", GF_LOG_WARNING, "!inode");
+                gf_msg_callingfn ("fd", GF_LOG_WARNING, EINVAL,
+                                  LG_MSG_INVALID_ARG, "!inode");
                 return NULL;
         }
 
@@ -720,7 +744,7 @@ fd_lookup_uint64 (inode_t *inode, uint64_t pid)
 }
 
 static fd_t *
-__fd_lookup_anonymous (inode_t *inode)
+__fd_lookup_anonymous (inode_t *inode, int32_t flags)
 {
         fd_t *iter_fd = NULL;
         fd_t *fd = NULL;
@@ -729,7 +753,7 @@ __fd_lookup_anonymous (inode_t *inode)
                 return NULL;
 
         list_for_each_entry (iter_fd, &inode->fd_list, inode_list) {
-                if (iter_fd->anonymous) {
+                if ((iter_fd->anonymous) && (flags == iter_fd->flags)) {
                         fd = __fd_ref (iter_fd);
                         break;
                 }
@@ -739,11 +763,11 @@ __fd_lookup_anonymous (inode_t *inode)
 }
 
 static fd_t *
-__fd_anonymous (inode_t *inode)
+__fd_anonymous (inode_t *inode, int32_t flags)
 {
         fd_t *fd = NULL;
 
-        fd = __fd_lookup_anonymous (inode);
+        fd = __fd_lookup_anonymous (inode, flags);
 
         /* if (fd); then we already have increased the refcount in
            __fd_lookup_anonymous(), so no need of one more fd_ref().
@@ -756,6 +780,7 @@ __fd_anonymous (inode_t *inode)
                         return NULL;
 
                 fd->anonymous = _gf_true;
+                fd->flags = GF_ANON_FD_FLAGS|flags;
 
                 __fd_bind (fd);
 
@@ -773,7 +798,26 @@ fd_anonymous (inode_t *inode)
 
         LOCK (&inode->lock);
         {
-                fd = __fd_anonymous (inode);
+                fd = __fd_anonymous (inode, GF_ANON_FD_FLAGS);
+        }
+        UNLOCK (&inode->lock);
+
+        return fd;
+}
+
+fd_t *
+fd_anonymous_with_flags (inode_t *inode, int32_t flags)
+{
+        fd_t *fd = NULL;
+
+        LOCK (&inode->lock);
+        {
+                if (flags & O_DIRECT)
+                        flags = GF_ANON_FD_FLAGS | O_DIRECT;
+                else
+                        flags = GF_ANON_FD_FLAGS;
+
+                fd = __fd_anonymous (inode, flags);
         }
         UNLOCK (&inode->lock);
 
@@ -781,18 +825,19 @@ fd_anonymous (inode_t *inode)
 }
 
 fd_t*
-fd_lookup_anonymous (inode_t *inode)
+fd_lookup_anonymous (inode_t *inode, int32_t flags)
 {
         fd_t *fd = NULL;
 
         if (!inode) {
-                gf_log_callingfn ("fd", GF_LOG_WARNING, "!inode");
+                gf_msg_callingfn ("fd", GF_LOG_WARNING, EINVAL,
+                                  LG_MSG_INVALID_ARG, "!inode");
                 return NULL;
         }
 
         LOCK (&inode->lock);
         {
-                fd = __fd_lookup_anonymous (inode);
+                fd = __fd_lookup_anonymous (inode, flags);
         }
         UNLOCK (&inode->lock);
         return fd;
@@ -855,10 +900,6 @@ __fd_ctx_set (fd_t *fd, xlator_t *xlator, uint64_t value)
                                   (sizeof (struct _fd_ctx)
                                    * new_xl_count));
                 if (tmp == NULL) {
-                        gf_log_callingfn (THIS->name, GF_LOG_WARNING,
-                                          "realloc of fd->_ctx for fd "
-                                          "(ptr: %p) failed, cannot set the key"
-                                          , fd);
                         ret = -1;
                         goto out;
                 }
@@ -890,7 +931,8 @@ fd_ctx_set (fd_t *fd, xlator_t *xlator, uint64_t value)
         int ret = 0;
 
 	if (!fd || !xlator) {
-                gf_log_callingfn ("", GF_LOG_WARNING, "%p %p", fd, xlator);
+                gf_msg_callingfn ("fd", GF_LOG_WARNING, EINVAL,
+                                  LG_MSG_INVALID_ARG, "%p %p", fd, xlator);
 		return -1;
         }
 

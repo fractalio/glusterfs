@@ -7,11 +7,6 @@
    later), or the GNU General Public License, version 2 (GPLv2), in all
    cases as published by the Free Software Foundation.
 */
-#ifndef _CONFIG_H
-#define _CONFIG_H
-#include "config.h"
-#endif
-
 #include "snapview-server.h"
 #include "snapview-server-mem-types.h"
 
@@ -335,6 +330,21 @@ out:
 }
 
 void
+svs_uuid_generate (uuid_t gfid, char *snapname, uuid_t origin_gfid)
+{
+        unsigned char md5_sum[MD5_DIGEST_LENGTH] = {0};
+        char          ino_string[NAME_MAX + 32]  = "";
+        int           ret                        = 0;
+
+        GF_ASSERT (snapname);
+
+        ret = snprintf (ino_string, sizeof (ino_string), "%s%s",
+                        snapname, uuid_utoa(origin_gfid));
+        MD5((unsigned char *)ino_string, strlen(ino_string), md5_sum);
+        gf_uuid_copy (gfid, md5_sum);
+}
+
+void
 svs_fill_ino_from_gfid (struct iatt *buf)
 {
         uint64_t  temp_ino = 0;
@@ -348,7 +358,7 @@ svs_fill_ino_from_gfid (struct iatt *buf)
         GF_VALIDATE_OR_GOTO (this->name, buf, out);
 
         /* consider least significant 8 bytes of value out of gfid */
-        if (uuid_is_null (buf->ia_gfid)) {
+        if (gf_uuid_is_null (buf->ia_gfid)) {
                 buf->ia_ino = -1;
                 goto out;
         }
@@ -380,7 +390,7 @@ svs_iatt_fill (uuid_t gfid, struct iatt *buf)
         buf->ia_blocks = 8;
         buf->ia_size = 4096;
 
-        uuid_copy (buf->ia_gfid, gfid);
+        gf_uuid_copy (buf->ia_gfid, gfid);
         svs_fill_ino_from_gfid (buf);
 
         buf->ia_prot = ia_prot_from_st_mode (0755);
@@ -475,7 +485,7 @@ __svs_initialise_snapshot_volume (xlator_t *this, const char *name,
                                        24007);
         if (ret) {
                 gf_log (this->name, GF_LOG_ERROR, "setting the "
-                        "volfile srever for snap volume %s "
+                        "volfile server for snap volume %s "
                         "failed", dirent->name);
                 goto out;
         }

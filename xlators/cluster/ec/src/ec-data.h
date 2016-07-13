@@ -58,7 +58,6 @@ struct _ec_config
 
 struct _ec_fd
 {
-    uintptr_t bad;
     loc_t     loc;
     uintptr_t open;
     int32_t   flags;
@@ -66,11 +65,18 @@ struct _ec_fd
 
 struct _ec_inode
 {
-    uintptr_t         bad;
-    ec_lock_t        *entry_lock;
     ec_lock_t        *inode_lock;
+    gf_boolean_t      have_info;
+    gf_boolean_t      have_config;
+    gf_boolean_t      have_version;
+    gf_boolean_t      have_size;
+    ec_config_t       config;
+    uint64_t          pre_version[2];
+    uint64_t          post_version[2];
+    uint64_t          pre_size;
+    uint64_t          post_size;
+    uint64_t          dirty[2];
     struct list_head  heal;
-
 };
 
 typedef int32_t (* fop_heal_cbk_t)(call_frame_t *, void * cookie, xlator_t *,
@@ -79,7 +85,6 @@ typedef int32_t (* fop_heal_cbk_t)(call_frame_t *, void * cookie, xlator_t *,
 typedef int32_t (* fop_fheal_cbk_t)(call_frame_t *, void * cookie, xlator_t *,
                                     int32_t, int32_t, uintptr_t, uintptr_t,
                                     uintptr_t, dict_t *);
-
 
 union _ec_cbk
 {
@@ -128,24 +133,40 @@ union _ec_cbk
     fop_xattrop_cbk_t      xattrop;
     fop_fxattrop_cbk_t     fxattrop;
     fop_zerofill_cbk_t     zerofill;
+    fop_seek_cbk_t         seek;
 };
 
 struct _ec_lock
 {
-    ec_lock_t        **plock;
+    ec_inode_t        *ctx;
     gf_timer_t        *timer;
+
+    /* List of owners of this lock. All fops added to this list are running
+     * concurrently. */
+    struct list_head   owners;
+
+    /* List of fops waiting to be an owner of the lock. Fops are added to this
+     * list when the current owner has an incompatible access (shared vs
+     * exclusive) or the lock is not acquired yet. */
     struct list_head   waiting;
+
+    /* List of fops that will wait until the next unlock/lock cycle. This
+     * happens when the currently acquired lock is decided to be released as
+     * soon as possible. In this case, all frozen fops will be continued only
+     * after the lock is reacquired. */
+    struct list_head   frozen;
+
+    int32_t            exclusive;
     uintptr_t          mask;
     uintptr_t          good_mask;
-    int32_t            kind;
-    int32_t            refs;
-    int32_t            acquired;
-    int32_t            have_size;
-    uint64_t           size;
-    uint64_t           size_delta;
-    uint64_t           version;
-    uint64_t           version_delta;
-    ec_fop_data_t     *owner;
+    uintptr_t          healing;
+    uint32_t           refs_owners;  /* Refs for fops owning the lock */
+    uint32_t           refs_pending; /* Refs assigned to fops being prepared */
+    gf_boolean_t       acquired;
+    gf_boolean_t       getting_size;
+    gf_boolean_t       release;
+    gf_boolean_t       query;
+    fd_t              *fd;
     loc_t              loc;
     union
     {
@@ -156,9 +177,13 @@ struct _ec_lock
 
 struct _ec_lock_link
 {
-    ec_lock_t *      lock;
-    ec_fop_data_t *  fop;
-    struct list_head wait_list;
+    ec_lock_t        *lock;
+    ec_fop_data_t    *fop;
+    struct list_head  owner_list;
+    struct list_head  wait_list;
+    gf_boolean_t      update[2];
+    loc_t            *base;
+    uint64_t          size;
 };
 
 struct _ec_fop_data
@@ -171,44 +196,48 @@ struct _ec_fop_data
     int32_t            winds;
     int32_t            jobs;
     int32_t            error;
-    ec_fop_data_t *    parent;
-    xlator_t *         xl;
-    call_frame_t *     req_frame;   // frame of the calling xlator
-    call_frame_t *     frame;       // frame used by this fop
-    struct list_head   cbk_list;    // sorted list of groups of answers
-    struct list_head   answer_list; // list of answers
-    ec_cbk_data_t *    answer;      // accepted answer
+    ec_fop_data_t     *parent;
+    xlator_t          *xl;
+    call_frame_t      *req_frame;    /* frame of the calling xlator */
+    call_frame_t      *frame;        /* frame used by this fop */
+    struct list_head   cbk_list;     /* sorted list of groups of answers */
+    struct list_head   answer_list;  /* list of answers */
+    struct list_head   pending_list; /* member of ec_t.pending_fops */
+    ec_cbk_data_t     *answer;       /* accepted answer */
     int32_t            lock_count;
     int32_t            locked;
     ec_lock_link_t     locks[2];
-    int32_t            locks_update;
-    int32_t            have_size;
-    uint64_t           pre_size;
-    uint64_t           post_size;
+    int32_t            first_lock;
     gf_lock_t          lock;
-    ec_config_t        config;
 
     uint32_t           flags;
     uint32_t           first;
     uintptr_t          mask;
+    uintptr_t          healing; /*Dispatch is done but call is successful only
+                                  if fop->minimum number of subvolumes succeed
+                                  which are not healing*/
     uintptr_t          remaining;
+    uintptr_t          received; /* Mask of responses */
     uintptr_t          good;
-    uintptr_t          bad;
+
+    uid_t              uid;
+    gid_t              gid;
 
     ec_wind_f          wind;
     ec_handler_f       handler;
     ec_resume_f        resume;
     ec_cbk_t           cbks;
-    void *             data;
+    void              *data;
     ec_heal_t         *heal;
+    struct list_head   healer;
 
     uint64_t           user_size;
     uint32_t           head;
 
     int32_t            use_fd;
 
-    dict_t *           xdata;
-    dict_t *           dict;
+    dict_t            *xdata;
+    dict_t            *dict;
     int32_t            int32;
     uint32_t           uint32;
     uint64_t           size;
@@ -218,14 +247,15 @@ struct _ec_fop_data
     entrylk_type       entrylk_type;
     gf_xattrop_flags_t xattrop_flags;
     dev_t              dev;
-    inode_t *          inode;
-    fd_t *             fd;
+    inode_t           *inode;
+    fd_t              *fd;
     struct iatt        iatt;
-    char *             str[2];
+    char              *str[2];
     loc_t              loc[2];
     struct gf_flock    flock;
-    struct iovec *     vector;
-    struct iobref *    buffers;
+    struct iovec      *vector;
+    struct iobref     *buffers;
+    gf_seek_what_t     seek;
 };
 
 struct _ec_cbk_data
@@ -239,13 +269,14 @@ struct _ec_cbk_data
     int32_t          op_errno;
     int32_t          count;
     uintptr_t        mask;
+    uint64_t         dirty[2];
 
     dict_t *         xdata;
     dict_t *         dict;
     int32_t          int32;
     uintptr_t        uintptr[3];
     uint64_t         size;
-    uint64_t         version;
+    uint64_t         version[2];
     inode_t *        inode;
     fd_t *           fd;
     struct statvfs   statvfs;
@@ -253,6 +284,10 @@ struct _ec_cbk_data
     struct gf_flock  flock;
     struct iovec *   vector;
     struct iobref *  buffers;
+    char            *str;
+    gf_dirent_t      entries;
+    off_t            offset;
+    gf_seek_what_t   what;
 };
 
 struct _ec_heal
@@ -269,6 +304,8 @@ struct _ec_heal
     fd_t             *fd;
     int32_t           partial;
     int32_t           done;
+    int32_t           error;
+    gf_boolean_t      nameheal;
     uintptr_t         available;
     uintptr_t         good;
     uintptr_t         bad;
@@ -276,7 +313,8 @@ struct _ec_heal
     uintptr_t         fixed;
     uint64_t          offset;
     uint64_t          size;
-    uint64_t          version;
+    uint64_t          total_size;
+    uint64_t          version[2];
     uint64_t          raw_size;
 };
 
@@ -291,5 +329,7 @@ ec_fop_data_t * ec_fop_data_allocate(call_frame_t * frame, xlator_t * this,
                                      ec_cbk_t cbks, void * data);
 void ec_fop_data_acquire(ec_fop_data_t * fop);
 void ec_fop_data_release(ec_fop_data_t * fop);
+
+void ec_fop_cleanup(ec_fop_data_t *fop);
 
 #endif /* __EC_DATA_H__ */
